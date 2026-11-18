@@ -52,7 +52,7 @@ class LoginTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
-        (self.home / "client_secret.json").write_text('{"installed":{"client_id":"fake"}}')
+        (self.home / "client_secret.json").write_text('{"installed":{"client_id":"fake","client_secret":"fixture"}}')
         self.fake = self.home / "fake-gws"
         self.fake.write_text(FAKE_GWS.replace("{python}", sys.executable))
         self.fake.chmod(0o700)
@@ -144,7 +144,7 @@ class LoginTests(unittest.TestCase):
     def test_global_gws_client_is_fallback_and_profile_client_overrides_it(self):
         profile = self.home / "client_secret.json"
         shared = self.home / "global-client.json"
-        shared.write_text('{"installed":{"client_id":"global"}}')
+        shared.write_text('{"installed":{"client_id":"global","client_secret":"fixture"}}')
         profile.unlink()
 
         with mock.patch.dict(os.environ, {"FAKE_GLOBAL_CLIENT": str(shared)}):
@@ -157,7 +157,7 @@ class LoginTests(unittest.TestCase):
         self.assertEqual((attempt.directory / "client_secret.json").read_bytes(), shared.read_bytes())
         self.manager.close()
 
-        profile.write_text('{"installed":{"client_id":"profile"}}')
+        profile.write_text('{"installed":{"client_id":"profile","client_secret":"fixture"}}')
         result = self.manager.start(
             self.home, "telegram", "100", "42", "user@example.com", str(self.fake),
             self.register, timeout=10, global_client=shared,
@@ -229,7 +229,7 @@ class LoginTests(unittest.TestCase):
         proceed.set()
         worker.join(3)
         self.assertFalse(worker.is_alive())
-        self.assertIn("no se pudo", result[0]["text"])
+        self.assertIn("could not be completed", result[0]["text"])
         self.assertFalse((self.home / "accounts" / "user@example.com").exists())
 
     def test_hook_registration_failure_does_not_leave_attempt(self):
@@ -247,7 +247,7 @@ class LoginTests(unittest.TestCase):
         redirect = parse_qs(urlsplit(result["url"]).query)["redirect_uri"][0]
         response = asyncio.run(self.handles[0][1](event=self.event(redirect + "?code=good")))
         self.assertEqual(response["action"], "rewrite")
-        self.assertIn("no se pudo", response["text"])
+        self.assertIn("could not be completed", response["text"])
         self.assertFalse((self.home / "accounts" / "other@example.com").exists())
 
     def test_any_surface_finishes_without_hook_and_is_session_bound(self):
@@ -288,8 +288,7 @@ class LoginTests(unittest.TestCase):
                                                      callback, profile="default")["ok"])
 
     def test_terminal_chat_rejects_invalid_codes_and_wrong_google_identity(self):
-        for account, query in (("user@example.com", "?code=good&code=bad"),
-                               ("user@example.com", "?code=bad"),
+        for account, query in (("user@example.com", "?code=bad"),
                                ("other@example.com", "?code=good")):
             with self.subTest(account=account, query=query):
                 result = self.manager.start(self.home, "cli", "session-1", "local", account,
@@ -357,7 +356,7 @@ class LoginTests(unittest.TestCase):
         response = self.finish_with(result, "good")
 
         self.assertEqual(response["action"], "rewrite")
-        self.assertIn("no se pudo", response["text"])
+        self.assertIn("could not be completed", response["text"])
         self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
         self.assertFalse(self.manager._attempts)
 
@@ -369,7 +368,7 @@ class LoginTests(unittest.TestCase):
         response = self.finish_with(result, "bad")
 
         self.assertEqual(response["action"], "rewrite")
-        self.assertIn("no se pudo", response["text"])
+        self.assertIn("could not be completed", response["text"])
         self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
         self.assertFalse(self.manager._attempts)
 
@@ -403,7 +402,7 @@ class LoginTests(unittest.TestCase):
             )
 
         self.assertFalse(response["ok"])
-        self.assertIn("no se pudo", response["error"])
+        self.assertIn("could not be completed", response["error"])
         self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
         self.assertFalse(list((self.home / "accounts").glob(".*.backup-*")))
         self.assertFalse(self.manager._attempts)
@@ -483,7 +482,7 @@ class LoginTests(unittest.TestCase):
         response = self.finish_with(result, "good")
         self.assertEqual(response["action"], "rewrite")
         self.assertIn("user@example.com", response["text"])
-        self.assertIn("navegador local", response["text"])
+        self.assertIn("local browser", response["text"])
         self.assertNotIn("code=", response["text"])
         self.assertFalse(self.manager._attempts)
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
@@ -502,7 +501,7 @@ class LoginTests(unittest.TestCase):
                                     str(self.fake), self.register, timeout=10)
         self.assertFalse(status["ok"])
         self.assertEqual(status["reason"], "identity_mismatch")
-        self.assertIn("no se pudo", status["error"])
+        self.assertIn("could not be completed", status["error"])
         fresh = self.manager.start(self.home, "telegram", "100", "42", "other@example.com",
                                    str(self.fake), self.register, timeout=10)
         self.assertTrue(fresh["ok"], "a consumed failure must not block a new login")
@@ -558,7 +557,7 @@ class LoginTests(unittest.TestCase):
         self.assertFalse(paster.is_alive())
         self.assertEqual(commits, [None])
         self.assertIn("user@example.com", outcome[0]["text"])
-        self.assertIn("navegador local", outcome[0]["text"])
+        self.assertIn("local browser", outcome[0]["text"])
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
         self.assertFalse(self.manager._attempts)
 
@@ -633,7 +632,7 @@ class LoginTests(unittest.TestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["reason"], "identity_mismatch")
         self.assertIn("a***o@kaito.io", response["error"])
-        self.assertIn("se pidió angello.picaso@kaito.io", response["error"])
+        self.assertIn("requested angello.picaso@kaito.io", response["error"])
         self.assertNotIn("angello.picasso@kaito.io", response["error"], "the full reported address is never echoed")
         self.assertFalse((self.home / "accounts" / "angello.picaso@kaito.io").exists())
         self.assertFalse((self.home / "accounts" / "angello.picasso@kaito.io").exists())
@@ -662,10 +661,247 @@ class LoginTests(unittest.TestCase):
         response = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com",
                                        attempt.redirect + "?code=bad")
         self.assertEqual(response["reason"], "gws_failed")
-        self.assertNotIn("bad", response["error"].replace("rechazado", ""))
-        self.assertIn("no se pudo", response["error"])
+        self.assertNotIn("bad", response["error"].replace("rejected", ""))
+        self.assertIn("could not be completed", response["error"])
         for reason in oauth._REASON_HINTS:
             self.assertIn(reason, oauth._failure_message(reason))
+
+
+    # --- lifecycle: status / cancel / retry / logout / crash cleanup ---
+
+    def pending(self):
+        return next(iter(self.manager._attempts.values()))
+
+    def test_status_is_bound_to_exact_session_and_account(self):
+        self.start()
+        attempt = self.pending()
+        ok = self.manager.status(self.home, "telegram", "100", "42", "user@example.com")
+        self.assertEqual(ok["state"], "waiting")
+        self.assertEqual(ok["client_source"], "profile")
+        self.assertNotIn("fake", json.dumps(ok), "status must not echo client IDs")
+        for args, profile in ((("telegram", "100", "43", "user@example.com"), ""),
+                              (("telegram", "101", "42", "user@example.com"), ""),
+                              (("discord", "100", "42", "user@example.com"), ""),
+                              (("telegram", "100", "42", "other@example.com"), ""),
+                              (("telegram", "100", "42", "user@example.com"), "other")):
+            self.assertEqual(self.manager.status(self.home, *args, profile=profile)["state"], "none")
+            self.assertFalse(self.manager.cancel(self.home, *args, profile=profile)["ok"])
+        self.assertTrue(attempt.directory.exists())
+        self.browser_hits_loopback(attempt)
+        done = self.manager.status(self.home, "telegram", "100", "42", "user@example.com")
+        self.assertEqual(done["state"], "finished")
+        self.assertTrue(done["ok"] and done["consumed"])
+        after = self.manager.status(self.home, "telegram", "100", "42", "user@example.com")
+        self.assertEqual(after, {"ok": True, "state": "none", "account_registered": True})
+
+    def test_cancel_stops_process_and_keeps_existing_credentials(self):
+        account = self.seed_account()
+        self.start(reauthorize=True)
+        attempt = self.pending()
+        response = self.manager.cancel(self.home, "telegram", "100", "42", "user@example.com")
+        self.assertEqual(response, {"ok": True, "cancelled": True, "account": "user@example.com", "committed": False})
+        self.assertIsNotNone(attempt.process.poll())
+        self.assertFalse(attempt.directory.exists())
+        self.assertEqual([p.name for p in (self.home / ".pending").iterdir()], [".lock"], "lease released with staging")
+        self.assertFalse(self.handles[0][0].active)
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertTrue(self.start(reauthorize=True)["ok"], "cancel frees the slot for a retry")
+
+    def test_cancel_during_exchange_prevents_late_commit(self):
+        import threading
+        self.start()
+        attempt = self.pending()
+        entered, proceed = threading.Event(), threading.Event()
+        original = self.manager._fetch_and_commit
+        def delayed(attempt, code, root):
+            entered.set()
+            proceed.wait(3)
+            return original(attempt, code, root)
+        self.manager._fetch_and_commit = delayed
+        outcome = []
+        worker = threading.Thread(target=lambda: outcome.append(self.manager.finish(
+            self.home, "telegram", "100", "42", "user@example.com", attempt.redirect + "?code=good")))
+        worker.start()
+        self.assertTrue(entered.wait(3))
+        self.assertTrue(self.manager.cancel(self.home, "telegram", "100", "42", "user@example.com")["ok"])
+        proceed.set()
+        worker.join(5)
+        self.assertFalse(outcome[0]["ok"])
+        self.assertEqual(outcome[0]["reason"], "cancelled")
+        self.assertFalse((self.home / "accounts" / "user@example.com").exists())
+        self.assertFalse(attempt.directory.exists())
+
+    def test_malformed_callback_keeps_attempt_for_retry(self):
+        result = self.start()
+        attempt = self.pending()
+        for query in ("", "?state=x", "?code=", "?code=good&code=bad", "?code=a%20b", "?code=good#frag", "?=&&"):
+            with self.subTest(query=query):
+                response = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com",
+                                               attempt.redirect + query)
+                self.assertFalse(response["ok"])
+                self.assertTrue(response["retryable"])
+                self.assertEqual(response["reason"], "invalid_callback")
+                self.assertIsNone(attempt.process.poll(), "gws loopback must stay alive")
+        hooked = asyncio.run(self.handles[0][1](event=self.event(attempt.redirect + "?state=x")))
+        self.assertEqual(hooked["action"], "rewrite")
+        self.assertIn("still pending", hooked["text"])
+        response = self.finish_with(result, "good")
+        self.assertIn("user@example.com", response["text"])
+        self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
+
+    def test_access_denied_cancels_with_stable_reason(self):
+        account = self.seed_account()
+        self.start(reauthorize=True)
+        attempt = self.pending()
+        response = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com",
+                                       attempt.redirect + "?error=access_denied")
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["reason"], "access_denied")
+        self.assertNotIn("retryable", response)
+        self.assertFalse(self.manager._attempts)
+        self.assertFalse(attempt.directory.exists())
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        other = self.manager.start(self.home, "telegram", "100", "42", "user@example.com", str(self.fake),
+                                   self.register, timeout=10, reauthorize=True)
+        response = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com",
+                                       self.pending().redirect + "?error=server_error")
+        self.assertEqual(response["reason"], "oauth_error")
+
+    def test_repeat_login_after_local_completion_reports_registered_account(self):
+        self.start(timeout=0.6)
+        self.browser_hits_loopback(self.pending())
+        from time import sleep
+        sleep(1.0)  # one-shot outcome released at the deadline, nobody read it
+        again = self.start()
+        self.assertEqual(again["reason"], "account_exists")
+        self.assertTrue(again["account_registered"])
+        renewed = self.start(reauthorize=True)
+        self.assertTrue(renewed["ok"])
+        self.assertTrue(renewed["reauthorize"])
+        self.assertIn("same machine", renewed["instructions"])
+        self.assertIn("another device", renewed["instructions"])
+
+    def test_client_preflight_rejects_unusable_json_without_echoing_ids(self):
+        client = self.home / "client_secret.json"
+        for content, needle in (('{"web":{"client_id":"leak-id","client_secret":"leak-secret"}}', "Web"),
+                                ('{"installed":{"client_id":"leak-id"}}', "client_secret"),
+                                ("not json leak-id", "JSON"),
+                                ("{" + " " * 70000 + "}", "too large")):
+            with self.subTest(needle=needle):
+                client.write_text(content)
+                result = self.start()
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["reason"], "client_invalid")
+                self.assertEqual(result["client_source"], "profile")
+                self.assertIn(needle, result["error"])
+                self.assertNotIn("leak", json.dumps(result))
+        self.assertFalse(self.manager._attempts)
+        missing = self.manager.start(self.home, "telegram", "100", "42", "user@example.com",
+                                     str(self.home / "no-such-gws"), self.register, timeout=10)
+        self.assertEqual(missing["reason"], "gws_not_found")
+
+    def test_logout_cancels_pending_and_blocks_commit_from_another_process(self):
+        account = self.seed_account()
+        self.start(reauthorize=True)
+        local = self.pending()
+        # A second manager stands in for another Hermes process with its own attempt.
+        other = LoginManager()
+        self.addCleanup(other.close)
+        other.start(self.home, "cli", "s", "local", "user@example.com", str(self.fake), None,
+                    timeout=10, reauthorize=True)
+        remote = next(iter(other._attempts.values()))
+        calls = []
+        def remove():
+            calls.append("removed")
+            oauth.shutil.rmtree(account)
+            return {"ok": True, "removed": True}
+        result = self.manager.logout(self.home, "User@Example.com", remove)
+        self.assertEqual(result, {"ok": True, "removed": True, "cancelled_logins": 1})
+        self.assertEqual(calls, ["removed"])
+        self.assertIsNotNone(local.process.poll())
+        response = other.finish(self.home, "cli", "s", "local", "user@example.com", remote.redirect + "?code=good")
+        self.assertEqual(response["reason"], "cancelled")
+        self.assertFalse(account.exists(), "a login started before logout must never reinstall credentials")
+        self.assertTrue(self.start()["ok"], "a fresh login after logout works")
+        self.assertFalse(self.manager.logout(self.home, "nope", remove)["ok"])
+
+    def test_crash_cleanup_removes_only_unleased_owned_staging(self):
+        import fcntl
+        pending = self.home / ".pending"
+        pending.mkdir()
+        crashed = pending / ("a" * 24)
+        crashed.mkdir()
+        (crashed / "credentials.enc").write_text("stale")
+        (pending / ("a" * 24 + ".lease")).touch()       # lease file left behind, no holder
+        live = pending / ("b" * 24)
+        live.mkdir()
+        fd = os.open(pending / ("b" * 24 + ".lease"), os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)                   # another live process holds this one
+        unknown = pending / "legacy-dir"
+        unknown.mkdir()                                  # no lease: never guessed at
+        self.assertTrue(self.start()["ok"])
+        mine = self.pending().directory
+        self.assertFalse(crashed.exists())
+        self.assertFalse((pending / ("a" * 24 + ".lease")).exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(unknown.exists())
+        self.assertTrue(mine.exists())
+        self.manager.close()
+        self.assertFalse(mine.exists())
+        self.assertFalse((pending / (mine.name + ".lease")).exists())
+
+
+    def test_scope_metadata_is_requested_not_granted(self):
+        scopes = ["openid", "https://www.googleapis.com/auth/drive.readonly"]
+        result = self.start(scope_mode="custom", scopes=scopes)
+        self.assertEqual((result["scope_mode"], result["requested_scopes"]), ("custom", scopes))
+        self.assertNotIn("granted_scopes", result)
+        status = self.manager.status(self.home, "telegram", "100", "42", "user@example.com")
+        self.assertEqual(status["requested_scopes"], scopes)
+        done = self.finish_with(result, "good")
+        self.assertIn("authorized in this profile", done["text"])
+        self.manager.close()
+        self.seed_account("full@example.com")
+        full = self.manager.start(self.home, "telegram", "100", "42", "full@example.com", str(self.fake),
+                                  self.register, timeout=10, reauthorize=True)
+        response = self.manager.finish(self.home, "telegram", "100", "42", "full@example.com",
+                                       self.pending().redirect + "?code=good")
+        self.assertEqual((full["scope_mode"], full["requested_scopes"]), ("full", []))
+        self.assertIn("identity_mismatch", response["reason"])  # fake reports user@example.com
+
+    def test_status_registered_requires_real_credential_slot(self):
+        accounts = self.home / "accounts"
+        (accounts / "empty@example.com").mkdir(parents=True)
+        real = self.seed_account("real@example.com")
+        (accounts / "link@example.com").symlink_to(real, target_is_directory=True)
+        state = lambda a: self.manager.status(self.home, "telegram", "100", "42", a)["account_registered"]
+        self.assertTrue(state("real@example.com"))
+        self.assertFalse(state("empty@example.com"))
+        self.assertFalse(state("link@example.com"))
+        self.assertFalse(state("../x"))
+        self.assertFalse(state(None))
+
+    def test_setup_failure_after_lease_leaves_no_staging_or_lease(self):
+        real_mkdir = Path.mkdir
+        def fail_staging(path, *args, **kwargs):
+            if path.parent.name == ".pending":
+                raise OSError("fixture")
+            return real_mkdir(path, *args, **kwargs)
+        with mock.patch.object(Path, "mkdir", fail_staging):
+            result = self.start()
+        self.assertEqual(result["reason"], "launch_failed")
+        self.assertEqual([p.name for p in (self.home / ".pending").iterdir()], [".lock"])
+        self.assertFalse(self.manager._attempts)
+
+    def test_unreadable_client_reports_source_not_crash(self):
+        with mock.patch.object(oauth, "_read_client", side_effect=PermissionError("fixture")):
+            result = self.start()
+        self.assertEqual((result["reason"], result["client_source"]), ("client_invalid", "profile"))
+        with mock.patch.object(oauth, "_select_client", side_effect=PermissionError("fixture")):
+            result = self.start()
+        self.assertEqual((result["reason"], result["client_source"]), ("client_invalid", "unknown"))
+        self.assertIn("could not be read", result["error"])
 
 
 if __name__ == "__main__":

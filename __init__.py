@@ -2,7 +2,7 @@
 import json
 
 from .oauth import LoginManager
-from .router import account_health, bounded_gws, execute_gws, list_accounts
+from .router import _ACCOUNT, account_health, bounded_gws, execute_gws, list_accounts, logout_account
 
 
 class _PluginClient:
@@ -71,6 +71,13 @@ def register(ctx):
         if not gateway_chat:
             chat = kwargs.get("session_id") or get_session_env("HERMES_SESSION_ID")
             user = user or "local"
+        action = args.get("action", "start")
+        if action not in ("start", "status", "cancel") or (
+                action != "start" and args.get("callback_url") is not None):
+            return json.dumps({"ok": False, "reason": "invalid_arguments"})
+        if action in ("status", "cancel"):
+            return json.dumps(getattr(manager, action)(
+                root(), platform, chat, user, args.get("account"), profile=profile))
         if args.get("callback_url") is not None:
             return json.dumps(manager.finish(
                 root(), platform, chat, user, args.get("account"), args["callback_url"],
@@ -151,6 +158,29 @@ def register(ctx):
 
     runtime = Runtime()
 
+    def logout(args, **kwargs):
+        account = args.get("account")
+        if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
+            return json.dumps({"ok": False, "error_code": "invalid_arguments"})
+        if get_hermes_home().resolve() != install_root.parent.resolve():
+            return json.dumps({"ok": False, "error_code": "profile_mismatch"})
+        try:
+            # Keep credentials until the worker has stopped remote subscriptions.
+            with runtime.store.tx() as conn:
+                blocked = conn.execute(
+                    "SELECT 1 FROM watches WHERE account=? AND "
+                    "(state IN ('active','matched') OR cleanup_state!='done') LIMIT 1",
+                    (account,),
+                ).fetchone()
+                if blocked:
+                    return json.dumps({"ok": False, "error_code": "watches_active",
+                        "error": "Stop this account's watches and let the worker finish cleanup before logging out."})
+                result = manager.logout(root(), account, lambda: logout_account(root(), account))
+        except (OSError, ValueError):
+            result = {"ok": False, "error_code": "local_error",
+                      "error": "Local credentials could not be removed safely."}
+        return json.dumps(result)
+
     from .workspace_tools import SCHEMAS, build_args
     from .api_policy import make_pre_tool_call_hook
 
@@ -187,14 +217,22 @@ def register(ctx):
 
     ctx.register_tool(
         name="gws_login", toolset="gws_oauth", handler=login,
-        schema={"name": "gws_login", "description": "Authorize one Google account for this single-operator Hermes profile on any frontend. Returns a Google consent URL; full native scopes remain the default. A browser on the Hermes host completes automatically: confirm with gws_accounts or repeat gws_login without callback_url for the one-shot stored outcome. From another device, paste the complete localhost callback URL in the originating session; gateway ingress intercepts it, otherwise finish using callback_url and the same account. Explicit callbacks pass through the model/history. Use reauthorize=true only to replace an existing account; old credentials remain until the new identity matches. Failures have stable reason codes; identity_mismatch reports a masked identity, so verify the exact requested spelling. Never request passwords, exported credentials, refresh tokens or standalone codes.",
+        schema={"name": "gws_login", "description": "Authorize one Google account for this single-operator Hermes profile on any frontend. Returns a Google consent URL; full native scopes remain the default. A browser on the Hermes host completes automatically: use action=status for the one-shot stored outcome or action=cancel to abandon the pending attempt without deleting existing credentials. From another device, paste the complete localhost callback URL in the originating session; gateway ingress intercepts it, otherwise finish using callback_url and the same account. Explicit callbacks pass through the model/history. Use reauthorize=true only to replace an existing account; old credentials remain until the new identity matches. Failures have stable reason codes; identity_mismatch reports a masked identity, so verify the exact requested spelling. Never request passwords, exported credentials, refresh tokens or standalone codes.",
                 "parameters": {"type": "object", "properties": {
                     "account": {"type": "string", "description": "Exact Google email address to authorize"},
+                    "action": {"type": "string", "enum": ["start", "status", "cancel"], "default": "start", "description": "Start or resume login, check its status, or cancel this session's pending login"},
                     "callback_url": {"type": "string", "description": "Complete localhost callback URL pasted by the user to finish this session’s pending login on any frontend"},
                     "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Native gws scope preset; full requests all supported service scopes"},
                     "scopes": {"type": "array", "items": {"type": "string"}, "description": "Exact OAuth scopes, required only with scope_mode=custom"},
                     "reauthorize": {"type": "boolean", "default": False, "description": "Explicitly renew an existing account. Old credentials remain until identity validation and replacement succeed; cancellation, expiry or rejection preserves them, and replacement failure attempts rollback."}},
                     "required": ["account"]}},
+    )
+    ctx.register_tool(
+        name="gws_logout", toolset="gws_oauth", handler=logout,
+        schema={"name": "gws_logout", "description": "Remove one account from this profile after Hermes approval. Cancels older pending logins and deletes only local account credentials, not Google data or Google-side consent. Stop watches and finish cleanup first. Prefer gws_login reauthorize=true for renewal without deleting working credentials.",
+                "parameters": {"type": "object", "additionalProperties": False,
+                               "properties": {"account": {"type": "string", "description": "Exact account email to remove locally"}},
+                               "required": ["account"]}},
     )
     ctx.register_tool(
         name="gws_accounts", toolset="gws_oauth", handler=accounts,

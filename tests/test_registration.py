@@ -20,7 +20,11 @@ class RegistrationTests(unittest.TestCase):
         tools = {}
         starts = []
         finishes = []
+        actions = []
         manager = SimpleNamespace(
+            status=lambda *a, **kw: actions.append(("status", a, kw)) or {"ok": True},
+            cancel=lambda *a, **kw: actions.append(("cancel", a, kw)) or {"ok": True},
+            logout=lambda root, account, remove: remove(),
             close=lambda: None,
             start=lambda *args, **kwargs: starts.append((args, kwargs)) or {"ok": True},
             finish=lambda *args, **kwargs: finishes.append((args, kwargs)) or {"ok": True},
@@ -58,7 +62,7 @@ class RegistrationTests(unittest.TestCase):
             self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
             self.assertFalse((state_dir / "client_secret.json").exists())
             from gws_oauth_test.workspace_tools import SCHEMAS
-            self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api",
+            self.assertEqual(set(tools), {"gws_login", "gws_logout", "gws_accounts", "gws_api",
                                           "gws_gmail_watch", "gws_drive_watch",
                                           "gws_calendar_watch"} | set(SCHEMAS))
             self.assertEqual(starts, [])
@@ -73,6 +77,14 @@ class RegistrationTests(unittest.TestCase):
             result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com"}))
             self.assertTrue(result["ok"])
             self.assertEqual(starts[0][0][1:5], ("discord", "thread-1", "user-1", "user@example.com"))
+            for action in ("status", "cancel"):
+                result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com", "action": action}))
+                self.assertTrue(result["ok"])
+                self.assertEqual(actions[-1], (action, starts[0][0][:5], {"profile": "default"}))
+            self.assertEqual(len(starts), 1)
+            for invalid in ({"action": "bad"}, {"action": "cancel", "callback_url": "localhost:1/?code=fixture"}):
+                self.assertEqual(json.loads(tools["gws_login"]["handler"](
+                    {"account": "user@example.com", **invalid}))["reason"], "invalid_arguments")
             for platform in ("cli", "tui", "desktop", "api_server", "custom_ui"):
                 session.clear()
                 session.update(HERMES_SESSION_SOURCE=platform, HERMES_SESSION_ID="terminal-1")
@@ -112,6 +124,26 @@ class RegistrationTests(unittest.TestCase):
                 checked = json.loads(tools["gws_accounts"]["handler"]({"check_health": True}))
             self.assertEqual(checked["accounts"], ["user@example.com"])
             self.assertEqual(checked["health"]["user@example.com"]["state"], "valid")
+            from gws_oauth_test.watch import WatchStore
+            store = WatchStore(home)
+            store.add_watch({"watch_id": "logout-test", "service": "gmail",
+                "account": "user@example.com", "profile": "default", "principal": "u",
+                "origin": {}, "mode": "new_session", "target": {}, "filters": {},
+                "instructions": "", "skills": [], "minutes": 1, "batch_seconds": 0,
+                "stop_after_match": False, "created_at": 1, "not_before": 1,
+                "expires_at": 2, "fingerprint": "logout-test"})
+            logout = tools["gws_logout"]["handler"]
+            for state, cleanup in (("active", "none"), ("matched", "done"), ("stopped", "pending")):
+                store.update_watch("logout-test", state=state, cleanup_state=cleanup)
+                self.assertEqual(json.loads(logout({"account": "user@example.com"}))["error_code"], "watches_active")
+                self.assertTrue((account / "credentials.enc").exists())
+            store.update_watch("logout-test", state="stopped", cleanup_state="done")
+            result = json.loads(logout({"account": "user@example.com"}))
+            self.assertTrue(result["removed"])
+            self.assertFalse(result["remote_revoked"])
+            self.assertFalse(account.exists())
+            self.assertFalse(json.loads(logout({"account": "user@example.com"}))["removed"])
+            self.assertEqual(json.loads(logout({"account": "../oops"}))["error_code"], "invalid_arguments")
 
 
 if __name__ == "__main__":

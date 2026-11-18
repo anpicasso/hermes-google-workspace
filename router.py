@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from contextlib import suppress
@@ -129,6 +130,34 @@ def list_accounts(root):
             continue
         names.append(path.name)
     return sorted(names)
+
+
+def logout_account(root, account):
+    """Remove one local account slot, not its Google-side authorization.
+
+    The caller must fence pending logins and active watch/cleanup work first.
+    Native logout leaves the directory behind, which blocks a fresh login.
+    """
+    if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
+        raise ValueError("Invalid account name")
+    root = Path(root)
+    if root.is_symlink():
+        raise ValueError("Refusing a symlinked credential root")
+    root = root.resolve()
+    base = root / "accounts"
+    if base.is_symlink():
+        raise ValueError("Refusing a symlinked account store")
+    with _commit_lock(base), _account_lock(root, account):
+        path = base / account
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise ValueError("Refusing an unsafe account slot")
+        removed = path.exists()
+        if removed:
+            # rmtree does not follow child symlinks; never delete the profile client.
+            shutil.rmtree(path)
+        return {"ok": True, "account": account, "removed": removed,
+                "remote_revoked": False,
+                "detail": "Local account credentials removed; Google authorization was not revoked."}
 
 
 def _account_env(path):

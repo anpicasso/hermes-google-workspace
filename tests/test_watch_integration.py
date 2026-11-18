@@ -119,7 +119,7 @@ class HostIntegrationTests(unittest.TestCase):
                 mock.patch("gateway.session_context.bound_session_key", return_value=""):
             plugin.register(ctx)
         from gws_oauth_int.workspace_tools import SCHEMAS
-        self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api",
+        self.assertEqual(set(tools), {"gws_login", "gws_logout", "gws_accounts", "gws_api",
                                       "gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"} | set(SCHEMAS))
         self.assertIn("pre_gateway_dispatch", hooks)
         self.assertIn("pre_tool_call", hooks)

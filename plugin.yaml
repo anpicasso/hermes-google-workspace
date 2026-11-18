@@ -10,6 +10,7 @@ python_dependencies:
   - aiohttp>=3.9,<4
 provides_tools:
   - gws_login
+  - gws_logout
   - gws_accounts
   - gws_api
   - gws_gmail_watch

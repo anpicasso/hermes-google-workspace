@@ -86,6 +86,11 @@ def make_pre_tool_call_hook(build_args=None, typed_names=()):
 
     def hook(tool_name="", args=None, **_):
         args = args if isinstance(args, dict) else {}
+        if tool_name == "gws_logout":
+            account = str(args.get("account") or "?")[:128]
+            return {"action": "approve", "rule_key": f"gws:{account}:logout",
+                    "message": f"Remove local Google credentials for {account} from this profile? "
+                               "This does not revoke Google-side consent or delete Google data."}
         if tool_name == "gws_api":
             argv = args.get("args")
         elif tool_name in typed and build_args is not None:
