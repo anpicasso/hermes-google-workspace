@@ -71,4 +71,20 @@ completion and non-gateway frontends can also expose URLs to model/history.
 Do not paste callbacks after the attempt expires. Never paste client secrets,
 exported credentials, refresh tokens or standalone codes.
 
+The gateway hook and explicit completion share one bounded URL parser, endpoint
+validation and exchange path. Plain `http://localhost:<port>/...` and the existing
+Safari `localhost:<port>/...` form are supported (scheme/host case-insensitive).
+The hook checks platform, chat, user and profile before inspecting a paste; an
+unrelated port is left alone. Duplicate or mixed code/error fields, blank codes,
+userinfo, fragments and embedded whitespace/control characters are rejected
+without consuming the attempt. Parsing is capped at 8 KiB and 32 query fields.
+Every recognized callback, including malformed pastes and exchange cancellation,
+uses the same sanitized rewrite and best-effort platform deletion path.
+
+This is deliberately **not a universal secret filter**: it does not extract URLs
+from prose/Markdown, watch unrelated conversations, or intercept after its pending
+login is removed or the process restarts. Paste only the plain callback while the
+login is pending. Generalizing the shared validation avoids drift without adding
+an always-on cross-plugin OAuth framework.
+
 Reference: [OAuth 2.0 authorization-code rules, RFC 6749 §4.1.2](https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2).

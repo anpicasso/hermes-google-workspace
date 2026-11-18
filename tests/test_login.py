@@ -131,6 +131,65 @@ class LoginTests(unittest.TestCase):
         self.assertNotIn("code=", response["text"])
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").exists())
 
+    def test_callback_audit_rejects_ambiguous_queries_without_exchange(self):
+        self.assertTrue(self.start()["ok"])
+        attempt = self.pending()
+        with mock.patch.object(self.manager, "_run_exchange") as exchange:
+            for suffix in ("?code=good&code=", "?code=good&error=", "?code=good&error=access_denied",
+                           "?error=access_denied&error=", "?code=good#", "?code=go\nod"):
+                with self.subTest(suffix=suffix):
+                    result = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com",
+                                                 attempt.redirect + suffix)
+                    self.assertEqual(result.get("reason"), "invalid_callback")
+                    self.assertTrue(result.get("retryable"))
+            exchange.assert_not_called()
+        self.assertIsNone(attempt.process.poll())
+
+    def test_callback_audit_scopes_malformed_urls_before_rewriting(self):
+        self.start()
+        for text in ("http://localhost:bad/?code=fixture", "http://localhost:" + "x" * 9000):
+            event = self.event(text)
+            event.source.profile = "other"
+            self.assertIsNone(asyncio.run(self.manager.on_message(event)))
+
+    def test_callback_audit_deletes_malformed_paste_best_effort(self):
+        self.start()
+        delete = mock.AsyncMock(side_effect=RuntimeError("synthetic deletion failure"))
+        gateway = SimpleNamespace(_delivery_adapter_for=lambda source: SimpleNamespace(delete_message=delete))
+        response = asyncio.run(self.manager.on_message(
+            self.event("http://localhost:bad/?code=fixture"), gateway=gateway))
+        self.assertEqual(response["action"], "rewrite")
+        self.assertNotIn("fixture", response["text"])
+        delete.assert_awaited_once_with("100", "321")
+
+    def test_callback_audit_shared_validation_and_cancellation_redaction(self):
+        self.start()
+        attempt = self.pending()
+        for suffix in ("/wrong?code=fixture", "?code=fixture&code=", "?code=fixture#",
+                       "?code=fixture&" + "&".join(f"x{i}=y" for i in range(33))):
+            with self.subTest(suffix=suffix):
+                url = attempt.redirect + suffix
+                explicit = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com", url)
+                intercepted = asyncio.run(self.manager.on_message(self.event(url)))
+                self.assertTrue(explicit.get("retryable"))
+                self.assertIn(explicit["error"], intercepted["text"])
+                self.assertNotIn("fixture", intercepted["text"])
+        url = attempt.redirect.replace("//localhost", "//@localhost") + "?code=fixture"
+        self.assertEqual(self.manager.finish(self.home, "telegram", "100", "42", "user@example.com", url)["reason"],
+                         "invalid_callback")
+        with mock.patch.object(oauth.asyncio, "to_thread", side_effect=asyncio.CancelledError):
+            result = asyncio.run(self.manager.on_message(self.event(attempt.redirect + "?code=fixture")))
+        self.assertEqual(result["action"], "rewrite")
+        self.assertNotIn("fixture", result["text"])
+        self.assertIsNone(attempt.process.poll())
+
+    def test_callback_audit_case_insensitive_endpoint(self):
+        self.start()
+        url = self.pending().redirect.replace("http://localhost", "HTTP://LOCALHOST") + "?code=good"
+        response = asyncio.run(self.manager.on_message(self.event(url)))
+        self.assertIsNotNone(response)
+        self.assertIn("user@example.com", response["text"])
+
     def test_login_requires_precreated_root_and_client(self):
         root = self.home / "fresh-profile" / "gws-oauth"
         result = self.manager.start(

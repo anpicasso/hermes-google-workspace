@@ -621,25 +621,13 @@ class LoginManager:
 
     def finish(self, root, platform, chat_id, user_id, account, callback_url, *, profile=""):
         """Complete a login explicitly on any surface, bound to its original identity."""
-        key = self._key(root, platform, chat_id, user_id, profile)
-        with self._lock:
-            attempt = self._attempts.get(key)
-        if attempt is None or not isinstance(account, str) or account.lower() != attempt.account:
+        key, attempt = self._lookup(root, platform, chat_id, user_id, account, profile)
+        if attempt is None:
             return {"ok": False, "reason": "no_pending", "error": "No pending login for this account in this session."}
         try:
-            if not isinstance(callback_url, str) or len(callback_url) > 8192:
-                raise ValueError("Invalid callback")
-            text = callback_url.strip()
-            if text.startswith("localhost:"):
-                text = "http://" + text
-            parsed = urlsplit(text)
-            redirect = urlsplit(attempt.redirect)
-            if (parsed.scheme != "http" or parsed.hostname != "localhost" or
-                    parsed.port != redirect.port or (parsed.path or "/") != (redirect.path or "/")):
-                raise ValueError("Invalid callback")
+            parsed = self._split_callback(callback_url)
         except ValueError:
-            return {"ok": False, "reason": "invalid_callback",
-                    "error": "Invalid callback URL; copy this login's full localhost URL."}
+            return self._invalid_callback()
         # ponytail: explicit completion uses normal tool arguments, not another ingress hook.
         return self._complete_callback(key, attempt, parsed)
 
@@ -714,31 +702,54 @@ class LoginManager:
             return dict(attempt.result)
 
     @staticmethod
+    def _invalid_callback():
+        return {"ok": False, "reason": "invalid_callback", "retryable": True,
+                "error": "Invalid callback URL; copy this login's full localhost URL again. "
+                         "The login is still pending."}
+
+    @staticmethod
+    def _split_callback(text):
+        """One bounded URL parser for explicit completion and gateway interception."""
+        if not isinstance(text, str) or len(text) > 8192:
+            raise ValueError("Invalid callback")
+        text = text.strip()
+        # urlsplit silently removes some controls; reject them before parsing.
+        if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in text) or "#" in text:
+            raise ValueError("Invalid callback")
+        if text.lower().startswith("localhost:"):
+            text = "http://" + text
+        parsed = urlsplit(text)
+        if (parsed.scheme != "http" or parsed.hostname != "localhost" or not parsed.port or
+                parsed.username is not None or parsed.password is not None):
+            raise ValueError("Invalid callback")
+        return parsed
+
+    @staticmethod
     def _parse_callback(parsed):
-        """Return (code, oauth_error); raise LoginError('invalid_callback') for retryable junk."""
+        """Return (code, oauth_error); reject ambiguous responses without consuming the attempt."""
         try:
-            query = parse_qs(parsed.query, strict_parsing=True)
+            query = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True,
+                             max_num_fields=32, errors="strict")
         except ValueError:
             raise LoginError("invalid_callback") from None
-        if parsed.username or parsed.password or parsed.fragment:
-            raise LoginError("invalid_callback")
         error = query.get("error", [])
-        if error:
-            # Google redirected with an explicit error: the consent is over, no code will follow.
-            return None, "access_denied" if error == ["access_denied"] else "oauth_error"
         code = query.get("code", [])
+        if "error" in query:
+            if len(error) != 1 or not error[0] or "code" in query:
+                raise LoginError("invalid_callback")
+            return None, "access_denied" if error == ["access_denied"] else "oauth_error"
         if len(code) != 1 or not _CODE.fullmatch(code[0]):
             raise LoginError("invalid_callback")
         return code[0], None
 
     def _complete_callback(self, key, attempt, parsed):
         try:
+            redirect = urlsplit(attempt.redirect)
+            if parsed.port != redirect.port or (parsed.path or "/") != (redirect.path or "/"):
+                raise LoginError("invalid_callback")
             code, oauth_error = self._parse_callback(parsed)
-        except LoginError as exc:
-            # Malformed paste (typo, truncated, missing code): keep the attempt for a retry.
-            return {"ok": False, "reason": exc.reason, "retryable": True,
-                    "error": "The pasted URL is not a valid callback for this login (missing code or truncated); "
-                             "copy the full localhost URL again. The login is still pending."}
+        except LoginError:
+            return self._invalid_callback()
         with self._lock, attempt.lock:
             if attempt.finished:
                 return self._take_result(key, attempt) or {"ok": False, "reason": "in_progress",
@@ -766,41 +777,33 @@ class LoginManager:
     async def on_message(self, event, **kwargs):
         source = event.source
         platform = getattr(getattr(source, "platform", None), "value", None)
+        identity = (str(platform), str(source.chat_id), str(source.user_id),
+                    str(getattr(source, "profile", "") or ""))
         with self._lock:
-            matching = [(key, attempt) for key, attempt in self._attempts.items()
-                        if key[1:4] == (str(platform), str(source.chat_id), str(source.user_id))]
+            matching = [(key, attempt) for key, attempt in self._attempts.items() if key[1:] == identity]
         if not matching:
             return None
         text = str(event.text or "").strip()
-        if text.startswith("localhost:"):
-            text = "http://" + text
-        elif not text.startswith("http://localhost:"):
+        # ponytail: intercept plain localhost pastes only, not arbitrary links or prose.
+        if not text[:17].lower().startswith(("localhost:", "http://localhost:")):
             return None
-        if len(text) > 8192:
-            return {"action": "rewrite", "text": "[Google Workspace: callback URL too long; start a new login.]"}
         try:
-            parsed = urlsplit(text)
-            port = parsed.port
+            parsed = self._split_callback(text)
         except ValueError:
-            return {"action": "rewrite", "text": "[Google Workspace: invalid callback URL; copy it again.]"}
-        with self._lock:
-            own_port = [(key, a) for key, a in matching if
-                        key[4] == str(getattr(source, "profile", "") or "") and
-                        parsed.scheme == "http" and parsed.hostname == "localhost" and
-                        port == urlsplit(a.redirect).port]
-            if not own_port:
-                return None
-            matches = [(key, a) for key, a in own_port if
-                       (parsed.path or "/") == (urlsplit(a.redirect).path or "/")]
+            result = self._invalid_callback()
+        else:
+            matches = [(key, a) for key, a in matching if parsed.port == urlsplit(a.redirect).port]
             if not matches:
-                return {"action": "rewrite", "text": "[Google Workspace: wrong callback path; copy it again.]"}
-            key, attempt = matches[0]
-        # Every recognised callback is rewritten, including all errors. Never log the URL.
-        try:
-            result = await asyncio.to_thread(self._complete_callback, key, attempt, parsed)
-            message = result.get("message") or f"[Google Workspace: {result['error']}]"
-        except (Exception, asyncio.CancelledError):
-            message = f"[Google Workspace: {_failure_message('internal')}]"
+                return None
+            result = self._invalid_callback()
+            if len(matches) == 1:
+                key, attempt = matches[0]
+                try:
+                    result = await asyncio.to_thread(self._complete_callback, key, attempt, parsed)
+                except (Exception, asyncio.CancelledError):
+                    result = {"error": _failure_message("internal")}
+        # All recognised paths share redaction and best-effort deletion, even malformed pastes.
+        message = result.get("message") or f"[Google Workspace: {result['error']}]"
         gateway = kwargs.get("gateway")
         message_id = str(getattr(source, "message_id", "") or getattr(event, "message_id", "") or "")
         if gateway is not None and message_id:
