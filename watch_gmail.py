@@ -422,6 +422,9 @@ def pubsub_pull(client, store, source, config, *, max_messages=20):
             continue
         address = str(payload.get("emailAddress") or "").strip().lower()
         history_id = payload.get("historyId")
+        # Gmail push uses a JSON integer; REST history responses use strings.
+        if type(history_id) is int and history_id >= 0:
+            history_id = str(history_id)
         if not address or not isinstance(history_id, str) or not history_id.isdigit():
             if isinstance(ack_id, str) and ack_id:
                 ack_ids.append(ack_id)

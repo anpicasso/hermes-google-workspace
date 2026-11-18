@@ -293,6 +293,19 @@ assert acquired.is_set()
             serialized = time.monotonic() - started
             self.assertGreater(serialized, 0.78)
 
+    def test_bounded_gws_accepts_empty_success_but_not_malformed_json(self):
+        from router import bounded_gws
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            _account(root)
+            for output, ok in (("", True), ("not json", False)):
+                fake = _fake_gws(tmp, "import sys\nsys.stdout.write(" + repr(output) + ")\n")
+                result = bounded_gws(root, "person@example.com", ["gmail", "users", "stop"],
+                                     gws_bin=str(fake))
+                self.assertEqual(result["ok"], ok)
+                if ok:
+                    self.assertEqual(result["data"], {})
+
     def test_bounded_gws_exposes_status_and_sanitizes_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "profile"

@@ -395,7 +395,8 @@ def bounded_gws(root, account, args, *, gws_bin="gws", timeout=30, max_output=1_
         return {"ok": False, "error_code": "output_too_large", "retryable": False,
                 "error": "La respuesta nativa excedió el límite de metadatos del worker."}
     try:
-        data = json.loads(result.stdout)
+        # Native no-content methods (including Gmail users.stop) emit no JSON.
+        data = json.loads(result.stdout) if result.stdout.strip() else {}
     except json.JSONDecodeError:
         return {"ok": False, "error_code": "invalid_response", "retryable": True,
                 "error": "gws devolvió una respuesta que no es JSON."}

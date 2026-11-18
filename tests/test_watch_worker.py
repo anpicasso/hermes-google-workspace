@@ -98,6 +98,17 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.routes.posts[0]["request_id"],
                          json.loads(rows[0]["request_id"]) if rows[0]["request_id"] and rows[0]["request_id"].startswith('"') else rows[0]["request_id"])
 
+    def test_history_success_does_not_hide_pubsub_failure(self):
+        row = self._gmail()
+        source = self.store.sources_for(row["watch_id"])[0]
+        with mock.patch.object(watch_worker.watch_gmail, "pubsub_pull", return_value={
+                "ok": False, "error_code": "pubsub_pubsub"}):
+            self.assertTrue(self.worker.drain_source(source)["ok"])
+        self.assertEqual(self.store.get_source(source["source_id"])["last_error"], "pubsub_pubsub")
+        with mock.patch.object(watch_worker.watch_gmail, "pubsub_pull", return_value={"ok": True}):
+            self.worker.drain_source(self.store.get_source(source["source_id"]))
+        self.assertIsNone(self.store.get_source(source["source_id"])["last_error"])
+
     def test_native_retry_is_stable_and_does_not_claim_delivery(self):
         watch_row = self._gmail()
         self.store.add_event(watch_row["watch_id"], "e1", "gmail", {"message_id": "m1"})

@@ -300,12 +300,12 @@ class Worker:
         if not watches:
             return {"ok": True, "skipped": "no consumers"}
         service = source["service"]
+        transport_error = None
         try:
             if service == "gmail":
                 pulled = watch_gmail.pubsub_pull(self.client, self.store, source, self.config)
-                if not pulled.get("ok") and not pulled.get("error_code", "").startswith("gmail_"):
-                    self.store.update_source(source["source_id"],
-                                             last_error=pulled.get("error_code", "pubsub error"))
+                if not pulled.get("ok"):
+                    transport_error = pulled.get("error_code", "pubsub error")
                 result = watch_gmail.drain(self.client, self.store, source, watches)
             elif service == "drive":
                 result = watch_drive.drain(self.client, self.store, source, watches)
@@ -327,7 +327,7 @@ class Worker:
                         gap="Drive change token was rejected; source requires an explicit resync/restart")
             return result
         self.store.settle_hints(source["source_id"])
-        self.store.update_source(source["source_id"], last_error=None)
+        self.store.update_source(source["source_id"], last_error=transport_error)
         return result
 
     # --- forwarding ------------------------------------------------------

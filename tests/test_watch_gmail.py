@@ -137,6 +137,20 @@ class GmailTests(unittest.TestCase):
         # The foreign notification belongs to another consumer; do not destroy it.
         self.assertEqual(ack["body"]["ackIds"], ["ack-150"])
 
+    def test_pubsub_accepts_live_numeric_history_id(self):
+        import base64
+        row, _ = self._watch(target={"mailbox": True})
+        source = self._source(row)
+        # The real Gmail notification encodes historyId as a JSON integer.
+        for value, expected in ((150, 1), (True, 0), (-1, 0), (1.5, 0)):
+            message = pubsub_message("person@example.com", "150")
+            message["message"]["data"] = base64.b64encode(json.dumps({
+                "emailAddress": "person@example.com", "historyId": value}).encode()).decode()
+            self.client.gmail["pubsub"] = [[message]]
+            result = watch_gmail.pubsub_pull(self.client, self.store, source, self.rt.config)
+            self.assertEqual(result["hints"], expected)
+        self.assertEqual(len(self.store.pending_hints(source["source_id"])), 1)
+
     def test_pubsub_multiplexes_accounts_sharing_one_subscription(self):
         self.client.add_message("root", "T1", internal_date="1600000000000")
         first, _ = self._watch(target={"mailbox": True})
