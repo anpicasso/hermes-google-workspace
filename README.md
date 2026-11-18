@@ -1,8 +1,8 @@
 # Hermes GWS OAuth
 
-Multi-account OAuth login and scope management for the [Google Workspace CLI (`gws`)](https://github.com/googleworkspace/cli) in Hermes Agent.
+Multi-account OAuth login, native `gws` passthrough, and targeted Gmail, Drive and Calendar watches for the [Google Workspace CLI (`gws`)](https://github.com/googleworkspace/cli) in Hermes Agent.
 
-The plugin keeps each account inside the active Hermes profile, exposes `gws` without adding a command denylist, and lets a user finish the otherwise-local OAuth callback from any Hermes platform. It does not share tokens across profiles or modify Hermes core.
+The plugin keeps each account inside the active Hermes profile, exposes `gws` without adding a command denylist, and lets a user finish the otherwise-local OAuth callback from any Hermes platform. It does not share tokens across profiles or modify Hermes core. Targeted watches run deterministic filters before any model invocation; see [docs/watch-setup.md](docs/watch-setup.md).
 
 ## Prerequisites
 
@@ -111,8 +111,9 @@ To renew an account that is already configured, call `gws_login` with `reauthori
 ## Tools
 
 - `gws_login(account, scope_mode="full", scopes=[], callback_url=None, reauthorize=False)` — starts OAuth for one account on any platform. Omit `callback_url` to start; pass it to finish an existing attempt with the same profile, surface, session and user identity. Set `reauthorize=true` only to renew an account that already exists; old credentials remain until the new identity is validated and committed.
-- `gws_accounts(check_health=False)` — lists the account labels stored in the active profile without revealing credentials. With `check_health=true`, runs native `gws auth status` per account (up to 20 seconds each) and returns `state` (`valid`, `invalid`, `stored`, `unreadable`), `stored` and `valid` separately, `reauth_required`, and a short `detail`. `stored` means the files exist but the live session was not confirmed; `valid` means native `gws` confirmed it. The plugin never decrypts credentials; `gws` owns refresh.
-- `gws_api(account, args)` — executes `gws` for one explicit account and passes `args` verbatim. Example: `args=["drive", "files", "list", "--params", "{\"pageSize\":5}"]`. On failure it returns `error_code`, `category`, `action`, `reauth_required`, and `exit_code` with a sanitized message; raw stdout/stderr are never returned because they can contain request data or token fragments.
+- `gws_accounts(check_health=False)` — lists the account labels stored in the active profile without revealing credentials. With `check_health=true`, runs native `gws auth status` per account (up to 20 seconds each) and returns `state` (`valid`, `invalid`, `stored`, `unreadable`), `stored` and `valid` separately, `reauth_required`, and a short `detail`. `stored` means the files exist but the live session was not confirmed; `valid` means native `gws` confirmed it. Health checks leave decryption and refresh to `gws`; the separate Pub/Sub worker exception is documented below.
+- `gws_api(account, args)` — executes `gws` for one explicit account and passes `args` verbatim (for example `["drive", "files", "list"]`). On failure it returns `error_code`, `category`, `action`, `reauth_required`, and `exit_code` with a sanitized message; raw stdout/stderr are never returned because they can contain request data or token fragments.
+- `gws_gmail_watch` / `gws_drive_watch` / `gws_calendar_watch` — `start | status | stop` for bounded targeted watches. Start requires an exact registered account, a service-specific `target`, and `delivery_mode=same_session|new_session`. Selectors are literal and deterministic; matching happens before a model runs. `status` without `watch_id` lists only the calling principal's watches for that service. `stop` requires an exact `watch_id` and reports local revocation separately from pending remote cleanup. See [docs/watch-setup.md](docs/watch-setup.md).
 
 Large successful responses (over 200,000 characters) return `output_file`, `output_bytes`, and `output_encoding="utf-8"` instead of inline `data`. The complete native stdout is saved in a unique private directory under `$HERMES_HOME/gws-oauth/response-*` (directory 0700, file 0600). Read it locally with code; Gmail attachment JSON contains base64url `data` that must be decoded to obtain the PDF. Native `--output` does not save these JSON responses. Delete the response file and its directory after processing; no automatic retention policy is imposed. Output remains buffered in memory. Failed native commands are never spilled. If local saving fails after native success, `output_write_failed` is returned: inspect remote state before retrying a mutating command.
 
@@ -130,11 +131,34 @@ Each account receives its own `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`.
 
 Every profile owns a separate `$HERMES_HOME/gws-oauth/` tree (e.g. `~/.hermes/gws-oauth/` for the default profile and `~/.hermes/profiles/<name>/gws-oauth/` for named profiles). Accounts, staging directories, the `accounts/.lock` file, `.encryption_key`, `credentials.enc` and `token_cache.json` all live inside that tree, so logging an account into one profile never reads or writes another profile's accounts. Each profile runs its own gateway process, so `LoginManager`, the temporary hook and the random loopback ports are independent as well. The only shared artifact is the read-only OAuth client (`~/.config/gws/client_secret.json` or a profile override); sharing one Desktop client across many accounts is normal. With `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` set, native `gws` writes nothing under `~/.config/gws/`. The same Google account may be authorized in two profiles; each holds its own refresh token.
 
+## Targeted watches
+
+The three watch tools share one private SQLite state database and one explicitly supervised worker. Start creates an owned native Hermes webhook route (or a same-session bridge route) before any Google subscription; the worker creates/renews Google push subscriptions, drains deltas, applies selectors locally, and forwards only matching metadata.
+
+```text
+Gmail users.watch -> Pub/Sub pull --------------------+
+Drive changes.watch -> HTTPS callback ---------------+-> durable hints -> cursor readers
+Calendar events.watch -> HTTPS callback -------------+   -> deterministic filters
+                                                         -> durable outbox -> native Hermes route
+```
+
+Highlights:
+
+- Gmail: exact conversation/message targets or an explicitly broad `mailbox: true`; literal sender/domain/label/subject filters and an optional MIME attachment predicate. History is read with `users.history.list`; Pub/Sub is pulled and acknowledged only after hints/cursors are durable. Message bodies are never fetched for notifications.
+- Drive: exact files, direct folder children (not recursive), or explicit `all_files`; literal filename/MIME and `appeared|updated|renamed|moved|trashed|restored|removed` categories. A removal means deleted or no longer accessible; it does not claim a narrower cause.
+- Calendar: exact calendars with optional event/series targets; organizer/attendee/title filters, changed-field narrowing, bounded date windows, and selected-attendee RSVP tracking. Recurrence is never expanded unboundedly; series + date window is rejected in this version.
+- `minutes` is the local authorization lifetime (1–1440), separate from Google's renewable subscription lease. `batch_seconds` is 0–60 and never delays a one-shot reservation.
+- A one-shot match reserves exactly one logical event, stops collection, and retains an admitted native route because this host exposes no supported completion signal. That route is intentionally retained until explicit operator review/stop; the tool reports `delivery_completion="unobservable"` rather than claiming a delivered message.
+- Same-session watches use the existing GOWA-style `pre_gateway_dispatch` bridge: check the stored physical session against the current session, then call `ctx.inject_message(session_key=...)`. No Hermes core patch is required. A reset observed before injection stops forwarding; a concurrent `/new` between this check and the host lookup can still race. Injection acceptance means scheduled, not delivered; ambiguous injections are not replayed.
+- Native new-session admission (`HTTP 202` or duplicate) proves admission only; it does not prove model execution or external delivery.
+
+Operator setup, required Google APIs/scopes, Pub/Sub IAM, callback TLS, the worker service, and exact limitations are in [docs/watch-setup.md](docs/watch-setup.md). The isolated test suite uses a deterministic fake Google transport; it is not proof of live Google behavior.
+
 ## Security and limitations
 
 - `gws auth login` 0.22.5 uses a random loopback callback without PKCE or `state`. The plugin correlates the live process, exact port, profile, chat, and sender; this mitigates confusion but does not replace PKCE.
-- Renewal never trusts the browser alone: the new staging directory is swapped into `accounts/<account>/` only after native `gws` exits successfully, writes `credentials.enc`, and reports the same Google identity. A per-profile file lock serializes commits and a failed replacement restores the previous directory when possible. The two renames are not crash-atomic: a process crash or failed rollback can leave a hidden `.ACCOUNT.backup-*` directory requiring local recovery. Plugin API calls and health checks take the same lock as commits. Avoid independently invoked native commands during renewal; external `gws` processes do not take this lock. The simple lock serializes plugin calls; per-account locking can replace it if throughput warrants.
-- Live health checks and error classification are allowlisted summaries. The plugin never decrypts credentials and never returns native stdout/stderr, which may contain request bodies, local paths, or token fragments. `gws` remains responsible for token refresh; an optional health check can cause that native refresh as a side effect.
+- Renewal never trusts the browser alone: the new staging directory is swapped into `accounts/<account>/` only after native `gws` exits successfully, writes `credentials.enc`, and reports the same Google identity. A profile-wide swap lock plus a stable per-account lock serialize commits and native readers: different accounts may run in parallel, the same account serializes, and a swap waits for all readers. A failed replacement restores the previous directory when possible. The two renames are not crash-atomic: a process crash or failed rollback can leave a hidden `.ACCOUNT.backup-*` directory requiring local recovery. Avoid independently invoked native commands during renewal; external `gws` processes do not take this lock.
+- Live health checks and error classification are allowlisted summaries. Health checks never return raw native stdout/stderr. Native `gws` owns decryption and Workspace token refresh. Exception: the Gmail Pub/Sub worker captures account-scoped `gws auth export --unmasked` into memory and refreshes an access token against Google for pull/ack only; it never logs or persists exported credentials or its access-token cache.
 - The pasted callback is not end-to-end secret on a messaging platform. The plugin rewrites recognized callbacks and attempts best-effort deletion, but platform servers, notifications, devices, and participants in a shared chat may retain or see copies. Choose the chat accordingly. Never send the OAuth client JSON, exported credentials, or refresh tokens through chat.
 - Paste the callback before the five-minute deadline. After expiry the temporary hook is gone and Hermes may receive the message normally.
 - Login completion works only in the process and profile that started it: the same chat and sender in gateway, or the same host-bound session identity in other frontends. Explicit callbacks are not redacted or removed by the plugin; they may reach the model provider, logs, and persisted history. API clients must preserve session identity and use the same worker process for both steps. There is no platform allowlist or denylist.
@@ -148,7 +172,7 @@ From a checkout:
 
 ```bash
 python -m unittest discover -s tests -v
-hermes plugins doctor . --ci
+hermes plugins doctor .
 hermes plugins validate .
 ```
 

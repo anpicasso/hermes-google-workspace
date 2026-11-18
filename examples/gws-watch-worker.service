@@ -1,0 +1,31 @@
+[Unit]
+Description=Hermes GWS targeted-watch worker (one profile)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Set the exact profile home; never rely on the login shell's default profile.
+Environment=HERMES_HOME=/home/example/.hermes
+# Replace with the immutable checkout/runtime path.
+WorkingDirectory=/opt/hermes-gws-oauth
+ExecStart=/usr/bin/python3 /opt/hermes-gws-oauth/watch_worker.py run \
+  --home /home/example/.hermes \
+  --gws-bin /usr/local/bin/gws \
+  --callback-host 127.0.0.1 \
+  --callback-port 8765 \
+  --gmail-topic projects/example-project/topics/gmail-watch \
+  --gmail-subscription projects/example-project/subscriptions/gmail-watch \
+  --callback-url https://watch.example.com
+Restart=on-failure
+RestartSec=10
+# The worker writes only the profile's plugin state; grant no broader access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/example/.hermes/plugin-data/gws-oauth
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,14 +1,36 @@
 name: gws-oauth
-version: 0.6.1
+version: 0.7.0
 manifest_version: 2
-description: Any-platform OAuth login, safe reauthorization, health checks, and native multi-account gws passthrough per Hermes profile
+kind: standalone
+description: Any-platform OAuth login, safe reauthorization, health checks, native multi-account gws passthrough, and targeted Gmail/Drive/Calendar watches per Hermes profile
 license: MIT
 provides_tools:
   - gws_login
   - gws_accounts
   - gws_api
+  - gws_gmail_watch
+  - gws_drive_watch
+  - gws_calendar_watch
+provides_hooks:
+  - pre_gateway_dispatch
 config_schema:
   gws_bin:
     type: str
     default: gws
     description: Path to the gws executable if it is not on the gateway PATH
+  watch_gmail_topic:
+    type: str
+    default: ""
+    description: Pub/Sub topic in the OAuth client project, e.g. projects/PROJECT/topics/gmail-watch
+  watch_gmail_subscription:
+    type: str
+    default: ""
+    description: Exact Pub/Sub subscription the worker may pull, e.g. projects/PROJECT/subscriptions/gmail-watch
+  watch_callback_url:
+    type: str
+    default: ""
+    description: Public HTTPS base that a reverse proxy/tunnel forwards to the worker's loopback callback receiver
+  watch_reconcile_seconds:
+    type: int
+    default: 300
+    description: Reconciliation interval for a durable source cursor; push hints still wake the worker independently

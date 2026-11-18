@@ -93,6 +93,34 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(out.strip(), "acquired")
 
+    @unittest.skipIf(os.name != "posix", "POSIX threaded flock regression")
+    def test_waiting_swap_does_not_block_reader_release(self):
+        import subprocess
+        code = """
+import sys, threading, time
+from pathlib import Path
+from router import _commit_lock
+accounts = Path(sys.argv[1])
+waiting = threading.Event()
+acquired = threading.Event()
+def swap():
+    waiting.set()
+    with _commit_lock(accounts):
+        acquired.set()
+with _commit_lock(accounts, shared=True):
+    thread = threading.Thread(target=swap, daemon=True)
+    thread.start()
+    assert waiting.wait(1)
+    time.sleep(0.1)
+    assert not acquired.is_set()
+thread.join(2)
+assert acquired.is_set()
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, "-c", code, tmp], timeout=5,
+                                    cwd=Path(__file__).resolve().parents[1], capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_health_inconclusive_does_not_request_reauthorization(self):
         with tempfile.TemporaryDirectory() as tmp:
             _account(tmp)
@@ -232,6 +260,55 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(result["data"]["args"], raw_args)
             with self.assertRaises(ValueError):
                 execute_gws(root, "../other", ["drive", "files", "list"], gws_bin=str(fake))
+
+    @unittest.skipIf(os.name != "posix", "POSIX flock check")
+    def test_different_accounts_run_in_parallel_while_same_account_serializes(self):
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            for name in ("one@example.com", "two@example.com"):
+                _account(root, name)
+            fake = _fake_gws(tmp, "import time\ntime.sleep(0.45)\nprint('{}')\n")
+
+            def run(name):
+                return execute_gws(root, name, ["drive", "files", "list"], gws_bin=str(fake))
+
+            started = time.monotonic()
+            threads = [threading.Thread(target=run, args=(name,)) for name in
+                       ("one@example.com", "two@example.com")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            parallel = time.monotonic() - started
+            self.assertLess(parallel, 0.78)
+
+            started = time.monotonic()
+            threads = [threading.Thread(target=run, args=("one@example.com",)) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            serialized = time.monotonic() - started
+            self.assertGreater(serialized, 0.78)
+
+    def test_bounded_gws_exposes_status_and_sanitizes_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            _account(root)
+            fake = _fake_gws(tmp, (
+                "import sys\n"
+                "sys.stdout.write('{\"error\":{\"code\":429,\"message\":\"secret-body\"}}')\n"
+                "sys.exit(1)\n"
+            ))
+            from router import bounded_gws
+            result = bounded_gws(root, "person@example.com", ["drive", "files", "list"],
+                                 gws_bin=str(fake))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["http_status"], 429)
+        self.assertTrue(result["retryable"])
+        self.assertNotIn("secret-body", json.dumps(result))
 
 
 if __name__ == "__main__":

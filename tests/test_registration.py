@@ -57,7 +57,15 @@ class RegistrationTests(unittest.TestCase):
             self.assertTrue(state_dir.is_dir())
             self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
             self.assertFalse((state_dir / "client_secret.json").exists())
-            self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api"})
+            self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api",
+                                          "gws_gmail_watch", "gws_drive_watch",
+                                          "gws_calendar_watch"})
+            for name in ("gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"):
+                schema = tools[name]["schema"]
+                self.assertEqual(schema["parameters"]["properties"]["action"]["enum"],
+                                 ["start", "status", "stop"])
+                self.assertFalse(schema["parameters"]["additionalProperties"])
+            self.assertNotIn("gws_watch", tools)
             result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com"}))
             self.assertTrue(result["ok"])
             self.assertEqual(starts[0][0][1:5], ("discord", "thread-1", "user-1", "user@example.com"))

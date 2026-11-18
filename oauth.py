@@ -30,9 +30,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 if __package__:
-    from .router import _commit_lock
+    from .router import _account_lock, _commit_lock
 else:  # Direct module use by the standalone test suite.
-    from router import _commit_lock
+    from router import _account_lock, _commit_lock
 
 _EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+%-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\Z")
 _URL = re.compile(r"https://accounts\.google\.com/[^\s]+")
@@ -141,23 +141,24 @@ def _mask_identity(email):
 def _install_attempt(attempt, destination, accounts):
     """Install validated credentials, replacing the old account only on success."""
     with _commit_lock(accounts):
-        if time.monotonic() >= attempt.deadline:
-            raise LoginError("expired", "El login venció antes de guardar las credenciales")
-        if destination.exists() or destination.is_symlink():
-            if destination.is_symlink() or not destination.is_dir():
-                raise LoginError("commit_failed", "La ruta de la cuenta existente no es un directorio válido")
-            if not attempt.reauthorize:
-                raise LoginError("account_exists", "La cuenta ya estaba registrada")
-            backup = accounts / f".{destination.name}.backup-{secrets.token_hex(6)}"
-            os.rename(destination, backup)
-            try:
+        with _account_lock(Path(accounts).resolve().parent, destination.name):
+            if time.monotonic() >= attempt.deadline:
+                raise LoginError("expired", "El login venció antes de guardar las credenciales")
+            if destination.exists() or destination.is_symlink():
+                if destination.is_symlink() or not destination.is_dir():
+                    raise LoginError("commit_failed", "La ruta de la cuenta existente no es un directorio válido")
+                if not attempt.reauthorize:
+                    raise LoginError("account_exists", "La cuenta ya estaba registrada")
+                backup = accounts / f".{destination.name}.backup-{secrets.token_hex(6)}"
+                os.rename(destination, backup)
+                try:
+                    os.rename(attempt.directory, destination)
+                except BaseException:
+                    os.rename(backup, destination)
+                    raise
+                _remove_path(backup)
+            else:
                 os.rename(attempt.directory, destination)
-            except BaseException:
-                os.rename(backup, destination)
-                raise
-            _remove_path(backup)
-        else:
-            os.rename(attempt.directory, destination)
 
 
 @dataclass
