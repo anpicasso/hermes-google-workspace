@@ -1,5 +1,7 @@
 # Targeted Workspace watches: operator setup
 
+Read [OAuth setup](oauth-setup.md) and the [catalog policy disclosure](catalog-policy.md): native credential storage and the Pub/Sub export/refresh path are known catalog blockers, not Hermes-managed OAuth.
+
 This guide covers the `gws_gmail_watch`, `gws_drive_watch` and `gws_calendar_watch` tools added in 0.7.0. The tools use the same profile-local `gws` accounts as `gws_login`/`gws_api`; they do not implement a second OAuth flow.
 
 ## What runs where

@@ -1,5 +1,7 @@
 # Workspace tools and approvals
 
+Start with [OAuth setup](oauth-setup.md) and [login/logout](login.md). Native credential handling conflicts with current catalog policy; see the [full disclaimer](catalog-policy.md).
+
 One profile is one trusted operator. Every connected Google account belongs to that operator; every session authorized to use this profile can use those accounts. Choose an explicit `account` on every Workspace call. Use separate profiles and access controls for different operators.
 
 ## Hybrid surface
@@ -42,7 +44,7 @@ The same `pre_tool_call` hook classifies generic and curated calls before execut
 
 - Known reads and schema/help discovery run without this additional gate.
 - Mutations (including drafts), deletes, sends, sharing, uploads and local output files request **native Hermes approval**. Unknown methods/options/helpers and most request bodies also request approval. Calendar free/busy is a known read-only POST exception.
-- The public native `auth` namespace is blocked even when invoked through the generic executor. Use `gws_login` or `gws_accounts(check_health=true)` instead. Worker-internal bounded auth is not exposed as an agent tool.
+- The public native `auth` namespace is blocked even when invoked through the generic executor. Use `gws_login`, `gws_logout` or `gws_accounts(check_health=true)` instead. Worker-internal bounded auth is not exposed as an agent tool.
 - Model arguments such as `approved=true` cannot grant approval. Host approval mode, existing operator grants and frontend approval support determine the result; this is not an independent per-call confirmation system or an OS sandbox.
 
 Curated approval previews always show recipients, attendees, share targets and paths in full; only body/description/message text is shortened. Generic `gws_api` previews are bounded and marked when truncated; inspect the full intended operation before approving a long generic request. A successful remote mutation followed by a local output/transport failure is not safe to blindly retry: read back the remote object first.

@@ -1,12 +1,14 @@
 # Manual OAuth client setup required
 
+**Not catalog-admitted:** native `gws` credential handling conflicts with current Hermes OAuth policy. Read [the full disclaimer](docs/catalog-policy.md) and [Google Cloud setup instructions](docs/oauth-setup.md) before connecting accounts.
+
 Plugin activation creates the private directory:
 
 ```text
 $HERMES_HOME/gws-oauth/
 ```
 
-Installation with `--enable` reloads a running gateway immediately. For CLI, TUI, Desktop or API use, load the updated plugin in the frontend's agent process and open a fresh session; no messaging gateway is required.
+Check the installer result for live gateway reload; support depends on the host. Begin a fresh session for updated tool schemas. For CLI, TUI, Desktop or API use, load the updated plugin in the frontend's agent process and open a fresh session; no messaging gateway is required.
 
 Before calling `gws_login`, configure a Google Desktop OAuth client in either location:
 
@@ -19,7 +21,7 @@ The profile file wins when both exist. Set file permissions to `0600`. Do not pa
 
 To renew an account that is already configured, call `gws_login` with `reauthorize=true` after this version is installed. The previous credentials stay in place until the new browser flow reports the requested identity. A mismatch, cancellation, or timeout leaves them intact; a failed replacement attempts to restore them. Avoid simultaneous native commands during the brief swap. See README for crash-recovery limitations. Use `gws_accounts(check_health=true)` for an optional live check that distinguishes stored credentials from a session confirmed by native `gws`.
 
-If the browser runs on the same host as Hermes, the redirect reaches the `gws` loopback directly and the login completes without pasting anything; the browser shows "Success". Confirm with `gws_accounts` or by calling `gws_login` again with the same `account` and no `callback_url`. Existing accounts and other profiles are untouched by this upgrade; a running gateway must be reloaded for the new behaviour to take effect.
+If the browser runs on the same host as Hermes, the redirect reaches the `gws` loopback directly and the login completes without pasting anything; the browser shows "Success". Confirm with `gws_accounts` or by calling `gws_login` with the same `account` and `action="status"`. Existing accounts and other profiles are untouched by this upgrade; a running gateway must be reloaded for the new behaviour to take effect.
 
 Run `gws auth status` to inspect the exact native `client_config` path on systems using a legacy location.
 
@@ -27,7 +29,7 @@ Run `gws auth status` to inspect the exact native `client_config` path on system
 
 One profile belongs to one trusted operator; connect that operator’s Google accounts only. Every authorized session in the profile can use those accounts. Full OAuth scope mode remains the default; the configured client and Google consent determine what can actually be granted.
 
-Prefer curated Gmail/Drive/Calendar tools for common operations, `gws_schema` for native request discovery, and `gws_api` for the rest. Public tools refuse native auth export/login/logout/setup commands; use `gws_login` and `gws_accounts(check_health=true)` instead. Mutations, destructive operations and local file input/output use Hermes approval, not a model-supplied confirmation flag.
+Prefer curated Gmail/Drive/Calendar tools for common operations, `gws_schema` for native request discovery, and `gws_api` for the rest. Public tools refuse native auth export/login/logout/setup commands; use `gws_login`, `gws_logout` and `gws_accounts(check_health=true)` instead. Native `gws auth` remains available in an operator terminal when configured; its client JSON is reusable, but global account credentials are not automatically imported. Local logout does not revoke Google consent; stop watches and finish cleanup first. Mutations, destructive operations and local file input/output use Hermes approval, not a model-supplied confirmation flag.
 
 ## Targeted watches are opt-in
 

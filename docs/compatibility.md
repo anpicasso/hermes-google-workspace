@@ -1,5 +1,7 @@
 # Compatibility
 
+**Runtime compatibility is not catalog eligibility.** Read the [policy disclaimer](catalog-policy.md); a green validator or CI run does not waive the credential-policy blocker.
+
 ## Tested combination
 
 The CI workflow (`.github/workflows/ci.yml`) covers exactly this setup:
@@ -12,8 +14,9 @@ The CI workflow (`.github/workflows/ci.yml`) covers exactly this setup:
 | PyYAML | 6.0.3 (same pin as Hermes' `uv.lock`) |
 | aiohttp | 3.14.5 (same pin as Hermes' `messaging` extra; required by the watch worker) |
 
-Only this commit has been tested. A Hermes release is supported only after the
-same suite passes on it. Matching version numbers alone do not count. The
+The suite has also passed against runtime commit
+`aaec1339aa325888919c522911c54a7e684c7f23`. This does not establish support for
+every intervening release. Matching version numbers alone do not count. The
 `requires_hermes` floor in `plugin.yaml` is a gate that stops installs on
 Hermes versions known to be too old. It does not mean every newer version has
 been tested.

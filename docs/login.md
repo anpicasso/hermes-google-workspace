@@ -1,5 +1,7 @@
 # Login lifecycle
 
+Configure your [Google Cloud Desktop OAuth client](oauth-setup.md) first. This flow uses native `gws`, not Hermes-managed OAuth; see the [catalog policy disclaimer](catalog-policy.md).
+
 One Hermes profile is one trusted operator with any number of Google accounts.
 The native `full` scope preset remains the default; use `readonly` or explicit
 `custom` scopes when desired. The Google consent screen determines what the user

@@ -1,5 +1,7 @@
 # Implementation and verification
 
+See [catalog policy and design decisions](catalog-policy.md) for the known credential-policy conflict and non-public host dependencies; [OAuth setup](oauth-setup.md) and [login/logout](login.md) are the operator guides.
+
 Plugin activation creates the profile-local `$HERMES_HOME/gws-oauth/` directory with mode `0700`. The plugin keeps a `LoginManager` inside the Hermes process that executes `gws_login`. For each login attempt it:
 
 1. Resolves `get_hermes_home()` for the active profile. It uses `gws-oauth/client_secret.json` when present; otherwise it asks `gws auth status` for the native global client path (normally `~/.config/gws/client_secret.json`). The profile client is therefore an override. Login never creates either file.
@@ -12,7 +14,7 @@ Plugin activation creates the profile-local `$HERMES_HOME/gws-oauth/` directory 
 
 `gws_accounts(check_health=true)` runs native `gws auth status` with the same filtered environment and account-local config directory used by `gws_api`. It returns a fixed summary: `stored` shows the account files exist, `valid` is `true` only when native `gws` confirms a live session, and `state` is `valid`, `invalid`, `stored`, or `unreadable`. This health path leaves decryption and token refresh to native `gws`, so a health check may update its token cache. The separate watch Pub/Sub transport exports selected-account credentials through native `gws` and refreshes access tokens in worker memory only.
 
-`gws_api` classifies native failures by exit code and an allowlist of safe signals (`invalid_grant`, `invalid_rapt`, permission markers, validation markers, HTTP status). It returns `error_code`, `category`, `action`, `reauth_required`, and `exit_code` with a fixed message. Raw stdout/stderr are never returned: they may contain request bodies, local paths, or token fragments. Auth failures point to `gws_login(..., reauthorize=true)`; permission failures point to scopes or API enablement; syntax and non-auth API failures do not suggest reauthorization.
+`gws_api` classifies native failures by exit code and an allowlist of safe signals (`invalid_grant`, `invalid_rapt`, permission markers, validation markers, HTTP status). It returns `error_code`, `category`, `action`, `reauth_required`, and `exit_code` with a fixed message. Raw failure stdout/stderr are never returned: they may contain request bodies, local paths, or token fragments. Successful Workspace output is returned as data or a private response file and can contain user content. Auth failures point to `gws_login(..., reauthorize=true)`; permission failures point to scopes or API enablement; syntax and non-auth API failures do not suggest reauthorization.
 
 `gws_api` selects the chosen account through `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` and executes `[gws_bin, *args]` without a shell. Public command validation blocks native auth lifecycle/export commands. Curated tools build validated native arguments and share the same executor and Hermes `pre_tool_call` approval policy. Internal watch credential operations remain private bounded calls, not agent-facing escape hatches. One profile is one trusted operator, not a multi-tenant service.
 
