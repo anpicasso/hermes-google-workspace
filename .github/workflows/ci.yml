@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Exact public Hermes host the plugin is tested against. Bump deliberately.
+  HERMES_REF: f7e2898aaefc8f967dbf7345e3999a65672fe60e
+  GWS_VERSION: 0.22.5
+  GWS_SHA256: de78ecdbd2f1a84cca0063a7ecbc440240fc14b6ebccbb17f4646b792a8c5c1f
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          path: plugin
+          persist-credentials: false
+
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_REF }}
+          path: hermes-agent
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: 0.13.5 # same uv as hermes-agent pm/lock.json at HERMES_REF
+
+      - name: Install pinned Hermes host (locked) + plugin runtime deps
+        working-directory: hermes-agent
+        run: |
+          uv sync --locked --python 3.14 --no-dev
+          # Plugin runtime deps, pinned to the versions in Hermes' uv.lock.
+          # aiohttp is only a Hermes extra, so install it explicitly.
+          uv pip install --python .venv/bin/python "PyYAML==6.0.3" "aiohttp==3.14.5"
+          echo "HERMES_PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
+          echo "HERMES_AGENT_SRC=$PWD" >> "$GITHUB_ENV"
+
+      - name: Install native gws (checksum verified)
+        run: |
+          set -euo pipefail
+          tgz=google-workspace-cli-x86_64-unknown-linux-gnu.tar.gz
+          curl -sSfL --retry 3 -o "$tgz" "https://github.com/googleworkspace/cli/releases/download/v${GWS_VERSION}/$tgz"
+          echo "${GWS_SHA256}  $tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar -xzf "$tgz" -C "$RUNNER_TEMP/bin" ./gws
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gws" --version
+
+      - name: Unit tests (no skips allowed)
+        working-directory: plugin
+        # No Google credentials exist here; GOOGLE_* is stripped and HOME/HERMES_HOME are empty temps.
+        run: |
+          env -i PATH="$PATH" HOME="$(mktemp -d)" HERMES_HOME="$(mktemp -d)" \
+            HERMES_DISABLE_LAZY_INSTALLS=1 HERMES_AGENT_SRC="$HERMES_AGENT_SRC" \
+            PYTHONPATH="$HERMES_AGENT_SRC" PYTHONDONTWRITEBYTECODE=1 \
+            "$HERMES_PYTHON" -c '
+          import sys, unittest
+          r = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover("tests"))
+          for test, why in r.skipped: print("SKIPPED:", test, why)
+          sys.exit(0 if r.wasSuccessful() and not r.skipped else 1)'
+
+      - name: hermes plugins validate / doctor
+        working-directory: hermes-agent
+        run: |
+          export HERMES_HOME="$(mktemp -d)" HERMES_DISABLE_LAZY_INSTALLS=1
+          "$HERMES_PYTHON" -m hermes_cli.main plugins validate "$GITHUB_WORKSPACE/plugin" --json
+          "$HERMES_PYTHON" -m hermes_cli.main plugins doctor "$GITHUB_WORKSPACE/plugin" --ci

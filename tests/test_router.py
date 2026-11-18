@@ -78,7 +78,7 @@ class RouterTests(unittest.TestCase):
                         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return mock.Mock(returncode=0, stdout='{"token_valid": true}', stderr="")
             with mock.patch("router.subprocess.run", side_effect=run_locked):
-                self.assertTrue(execute_gws(tmp, "person@example.com", ["auth", "status"])["ok"])
+                self.assertTrue(execute_gws(tmp, "person@example.com", ["drive", "files", "list"])["ok"])
                 self.assertTrue(account_health(tmp, "person@example.com")["valid"])
             code = ("from pathlib import Path\nfrom router import _commit_lock\n"
                     "import sys\nprint('ready', flush=True)\n"
@@ -215,6 +215,34 @@ assert acquired.is_set()
                 health = account_health(root, "person@example.com", gws_bin=str(fake))
             self.assertEqual(health["state"], "unreadable")
             self.assertTrue(health["reauth_required"])
+
+    def test_public_execute_blocks_auth_but_internal_bounded_keeps_it(self):
+        from router import bounded_gws
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            _account(root)
+            fake = _fake_gws(tmp, "print('{\"refresh_token\": \"secret-refresh\"}')\n")
+            for argv in (["auth", "export", "--unmasked"], ["--format", "json", "auth", "export"],
+                         ["help", "auth", "export"]):
+                result = execute_gws(root, "person@example.com", argv, gws_bin=str(fake))
+                self.assertEqual(result["error_code"], "auth_blocked")
+                self.assertNotIn("secret", json.dumps(result))
+            internal = bounded_gws(root, "person@example.com", ["auth", "export"], gws_bin=str(fake))
+            self.assertTrue(internal["ok"])
+
+    def test_health_reports_only_sanitized_granted_scopes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            _account(root)
+            status = {"token_valid": True, "access_token": "ya29.secret", "scopes": [
+                "https://www.googleapis.com/auth/drive", "openid", "https://www.googleapis.com/auth/drive",
+                "ya29.secret-token", "https://evil.example/auth?x=secret", 7]}
+            fake = _fake_gws(tmp, "print(" + repr(json.dumps(status)) + ")\n")
+            health = account_health(root, "person@example.com", gws_bin=str(fake))
+            self.assertEqual(health["scopes"], ["https://www.googleapis.com/auth/drive", "openid"])
+            self.assertNotIn("secret", json.dumps(health))
+            fake = _fake_gws(tmp, "print('{\"token_valid\": true}')\n")
+            self.assertNotIn("scopes", account_health(root, "person@example.com", gws_bin=str(fake)))
 
     def test_health_failure_is_sanitized_and_marks_account_invalid(self):
         with tempfile.TemporaryDirectory() as tmp:

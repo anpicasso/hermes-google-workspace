@@ -57,9 +57,13 @@ class RegistrationTests(unittest.TestCase):
             self.assertTrue(state_dir.is_dir())
             self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
             self.assertFalse((state_dir / "client_secret.json").exists())
+            from gws_oauth_test.workspace_tools import SCHEMAS
             self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api",
                                           "gws_gmail_watch", "gws_drive_watch",
-                                          "gws_calendar_watch"})
+                                          "gws_calendar_watch"} | set(SCHEMAS))
+            self.assertEqual(starts, [])
+            self.assertEqual(tools["gws_login"]["schema"]["parameters"]["properties"]
+                             ["scope_mode"]["default"], "full")
             for name in ("gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"):
                 schema = tools[name]["schema"]
                 self.assertEqual(schema["parameters"]["properties"]["action"]["enum"],

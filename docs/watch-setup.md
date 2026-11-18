@@ -83,18 +83,27 @@ python /absolute/path/to/gws-oauth/watch_worker.py run \
 
 The worker takes one advisory lock per profile (`plugin-data/gws-oauth/worker.lock`); a second worker for the same home refuses to start. The watch worker currently requires POSIX file locking; Windows watch-worker startup is unsupported. The included service example and verified lifecycle are Linux-only.
 
-A Linux user-service example is in [`examples/gws-watch-worker.service`](../examples/gws-watch-worker.service). Keep the checkout/runtime path immutable across restarts, set the unit's `Environment=HERMES_HOME=...`, and grant only the service account's read access to the profile tree.
+A Linux user-service example is in [`examples/gws-watch-worker.service`](../examples/gws-watch-worker.service). Use the same dependency-complete Python environment as Hermes (including `aiohttp` and `PyYAML`), not an arbitrary system Python. Replace every example path and keep the checkout/runtime immutable across restarts. The worker needs write access to the exact profile home: SQLite state, native account token refresh, and native webhook CAS/atomic replacement all write there. A writable webhook file alone is insufficient because atomic replacement creates a sibling temporary file. The example deliberately grants the whole selected profile write access; it is not isolation between accounts in that profile. No service is installed automatically.
 
 Operator recovery:
 
 ```bash
 python watch_worker.py list --home "$HERMES_HOME"
+python watch_worker.py status --home "$HERMES_HOME" --stale-seconds 60
 python watch_worker.py stop <watch_id> --home "$HERMES_HOME"
 ```
 
 `stop` revokes local collection/forwarding first and reports remote cleanup separately. The worker performs owned route/channel cleanup on its next pass; operator-provisioned Pub/Sub topics and subscriptions are never deleted. A one-shot `new_session` route is retained after admission because Hermes exposes no supported completion observation. Explicit `stop` releases it after review and may cancel an admitted reply that has not yet been sent; already sent output cannot be recalled. Automatic expiry never removes a native route after a delivery attempt.
 
 ## Tool contract
+
+### Retry, retention and diagnostics
+
+Subscription create/renew and remote stop failures use durable exponential backoff (first retry after 10 seconds, capped at 900 seconds). Restarting the worker preserves the retry schedule; a fresh explicit start on an unused source clears it. Failed channel registrations retain one diagnostic error row rather than growing the database on every retry. Cursor reconciliation remains independent of push setup success.
+
+Worker CLI `run --subscription-backoff-max SECONDS --retention-days DAYS` adjusts the defaults. These are worker arguments, not gateway plugin settings. Once an hour, fully cleaned terminal watches older than the retention window (default 7 days) are pruned along with obsolete hints and expired lease records. In-flight or uncertain delivery evidence, pending cleanup and retained native routes are not pruned. Age is measured from the watch expiry, so early stops may be retained longer.
+
+`status` reports worker lock ownership, heartbeat age, watch counts, pending cleanup, retained routes, and source lease/error/retry summaries without secrets. It exits 1 when the worker is absent or its heartbeat is stale. A worker loop with slow upstream calls may exceed 60 seconds; choose a health threshold appropriate to the configured accounts and call timeouts. A healthy worker heartbeat is not proof of Google delivery or agent execution.
 
 ```json
 {"tool":"gws_gmail_watch","arguments":{"action":"start","account":"user@example.com","target":{"thread_ids":["THREAD_A"]},"filters":{"from_addresses":["alice@example.com"]},"delivery_mode":"new_session","minutes":120,"stop_after_match":true}}
@@ -122,4 +131,4 @@ Rules: list values are OR, distinct filter fields are AND, string contains uses 
 - Metadata egress is bounded; matching may read more metadata locally than is forwarded. The plugin cannot detect every other application using the same Google topic/subscription; it stops only resources it owns.
 - The included tests use a deterministic simulated Google transport, mocked delivery, and isolated real-host webhook CAS/injection API checks. They prove state-machine, selector, cursor, callback, and route-CAS mechanics; they are **not** live Google or native-session proof.
 
-The verified baseline for this implementation is plugin commit `03916ce` reconciled with remote main, `gws` 0.22.5, and the installed Hermes host described in `docs/implementation.md`. Re-validate these seams after upgrading either.
+See [compatibility.md](compatibility.md) for the tested host/CLI baseline and CI scope. Re-validate the native webhook and approval seams after upgrading either.

@@ -60,6 +60,19 @@ def same_session_capability(ctx):
         return {"supported": False, "error_code": "same_session_host_unsupported",
                 "message": "This Hermes host has no plugin session injection; same-session watches are "
                            "unavailable. Use delivery_mode=new_session."}
+    # Preflight the host's own consent gate when it exposes one, so a watch is
+    # never armed only to fail at delivery. Absent probe = old host, decided at delivery.
+    allowed = getattr(ctx, "_gateway_injection_allowed", None)
+    if callable(allowed):
+        try:
+            permitted = allowed() is True
+        except Exception:
+            permitted = False
+        if not permitted:
+            return {"supported": False, "error_code": "same_session_not_permitted",
+                    "message": "Gateway session injection is not enabled for this plugin "
+                               "(plugins.entries.<plugin>.allow_gateway_injection: true). "
+                               "Enable it explicitly or use delivery_mode=new_session."}
     return {"supported": True, "keyword": "session_key"}
 
 

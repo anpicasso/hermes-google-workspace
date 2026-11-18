@@ -419,6 +419,9 @@ class WatchStore:
                         "UPDATE sources SET cursor=?, cursor_staged=NULL, state='active', "
                         "channel_id=NULL, channel_token=NULL, resource_id=NULL, expires_at=NULL, "
                         "last_error=NULL WHERE source_id=?", (source.get("cursor"), source_id))
+                    # A fresh explicit start retries registration immediately.
+                    conn.execute("DELETE FROM meta WHERE key IN (?,?)",
+                                 ("backoff:sub:" + source_id, "backoff:stop:" + source_id))
                 conn.execute("INSERT INTO watch_sources (watch_id, source_id) VALUES (?,?)",
                              (record["watch_id"], source_id))
         return self.get_watch(record["watch_id"])
@@ -941,11 +944,67 @@ class WatchStore:
         with self.tx() as conn:
             conn.execute("DELETE FROM remotes WHERE remote_id=?", (remote_id,))
 
+    def stop_source_if_unused(self, source_id):
+        """Mark a source stopped only if no active watch re-armed it meanwhile.
+
+        Remote stop calls run outside any transaction; a concurrent start can
+        reset and reuse the same source while they are in flight.
+        """
+        with self.tx() as conn:
+            cursor = conn.execute(
+                "UPDATE sources SET state='stopped' WHERE source_id=? AND NOT EXISTS ("
+                "SELECT 1 FROM watch_sources x JOIN watches w ON w.watch_id=x.watch_id "
+                "WHERE x.source_id=? AND w.state='active')", (source_id, source_id))
+            return bool(cursor.rowcount)
+
+    def prune(self, now=None, *, retention_seconds=7 * 86400):
+        """Delete terminal, fully cleaned records older than the retention window.
+
+        Only ``cleanup_state='done'`` watches go (their route is already removed);
+        ``retained``/``pending`` cleanup keeps uncertain or admitted native
+        routes and their outbox evidence until an explicit stop finishes them.
+        """
+        now = self.clock() if now is None else now
+        cutoff = now - retention_seconds
+        with self.tx() as conn:
+            # ponytail: age from expires_at (no terminal timestamp column); a stop
+            # can precede expiry by at most MAX_MINUTES, which only delays pruning.
+            ids = [row["watch_id"] for row in conn.execute(
+                "SELECT watch_id FROM watches w WHERE cleanup_state='done' "
+                "AND state IN ('stopped','expired','matched') AND expires_at<? "
+                "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.watch_id=w.watch_id "
+                "AND (o.updated_at>=? OR o.state IN ('pending','retry','forwarding','injecting','uncertain')))",
+                (cutoff, cutoff)).fetchall()]
+            for watch_id in ids:
+                for table in ("outbox", "watch_sources", "remotes", "watches"):
+                    conn.execute(f"DELETE FROM {table} WHERE watch_id=?", (watch_id,))
+            conn.execute("DELETE FROM hints WHERE state='done' AND created_at<?", (cutoff,))
+            conn.execute("DELETE FROM delivered WHERE at<?", (cutoff,))
+            # Lapsed Google leases (Google stops calling after expiry) and stale
+            # registration-error diagnostics; owned native routes are never touched here.
+            conn.execute("DELETE FROM remotes WHERE kind!='native_route' AND ("
+                         "(expires_at IS NOT NULL AND expires_at<?) "
+                         "OR (state='error' AND updated_at<?))", (cutoff, cutoff))
+            orphans = [row["source_id"] for row in conn.execute(
+                "SELECT source_id FROM sources s WHERE state='stopped' AND NOT EXISTS ("
+                "SELECT 1 FROM watch_sources x WHERE x.source_id=s.source_id) AND NOT EXISTS ("
+                "SELECT 1 FROM remotes r WHERE r.source_id=s.source_id)").fetchall()]
+            for source_id in orphans:
+                conn.execute("DELETE FROM hints WHERE source_id=?", (source_id,))
+                conn.execute("DELETE FROM sources WHERE source_id=?", (source_id,))
+                conn.execute("DELETE FROM meta WHERE key IN (?,?)",
+                             ("backoff:sub:" + source_id, "backoff:stop:" + source_id))
+        return {"watches": len(ids), "sources": len(orphans)}
+
     # --- meta ------------------------------------------------------------
     def set_meta(self, key, value):
         with self.tx() as conn:
             conn.execute("INSERT INTO meta (key, value) VALUES (?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def delete_meta(self, key):
+        with self.tx() as conn:
+            conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
     def get_meta(self, key, default=None):
         with self.read() as conn:

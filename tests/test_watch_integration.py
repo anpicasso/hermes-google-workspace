@@ -118,9 +118,11 @@ class HostIntegrationTests(unittest.TestCase):
                 mock.patch("gateway.session_context.get_session_env", return_value=None), \
                 mock.patch("gateway.session_context.bound_session_key", return_value=""):
             plugin.register(ctx)
+        from gws_oauth_int.workspace_tools import SCHEMAS
         self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api",
-                                      "gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"})
+                                      "gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"} | set(SCHEMAS))
         self.assertIn("pre_gateway_dispatch", hooks)
+        self.assertIn("pre_tool_call", hooks)
         self.assertFalse((self.home / "plugin-data" / "gws-oauth" / "worker.lock").exists())
         # Registration never starts the supervised worker; its lock only exists after `run`.
         self.assertTrue(all("watch-worker" not in thread.name for thread in __import__("threading").enumerate()))

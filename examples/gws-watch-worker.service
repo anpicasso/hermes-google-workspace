@@ -9,7 +9,7 @@ Type=simple
 Environment=HERMES_HOME=/home/example/.hermes
 # Replace with the immutable checkout/runtime path.
 WorkingDirectory=/opt/hermes-gws-oauth
-ExecStart=/usr/bin/python3 /opt/hermes-gws-oauth/watch_worker.py run \
+ExecStart=/home/example/.hermes/hermes-agent/venv/bin/python /opt/hermes-gws-oauth/watch_worker.py run \
   --home /home/example/.hermes \
   --gws-bin /usr/local/bin/gws \
   --callback-host 127.0.0.1 \
@@ -19,12 +19,14 @@ ExecStart=/usr/bin/python3 /opt/hermes-gws-oauth/watch_worker.py run \
   --callback-url https://watch.example.com
 Restart=on-failure
 RestartSec=10
-# The worker writes only the profile's plugin state; grant no broader access.
+# Use the dependency-complete Hermes Python above (aiohttp + PyYAML).
+# Native route CAS uses atomic rename in the profile root; token refresh also writes.
+# This grants the selected profile write access, not just the SQLite directory.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/example/.hermes/plugin-data/gws-oauth
+ReadWritePaths=/home/example/.hermes
 UMask=0077
 
 [Install]

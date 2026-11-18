@@ -1,9 +1,13 @@
 name: gws-oauth
-version: 0.7.0
+version: 0.8.0
 manifest_version: 2
 kind: standalone
-description: Any-platform OAuth login, safe reauthorization, health checks, native multi-account gws passthrough, and targeted Gmail/Drive/Calendar watches per Hermes profile
+description: Profile-scoped Google OAuth, curated Gmail/Drive/Calendar tools, approval-gated native gws access, and targeted watches
 license: MIT
+requires_hermes: ">=0.23.2"
+python_dependencies:
+  - PyYAML>=6,<7
+  - aiohttp>=3.9,<4
 provides_tools:
   - gws_login
   - gws_accounts
@@ -11,8 +15,22 @@ provides_tools:
   - gws_gmail_watch
   - gws_drive_watch
   - gws_calendar_watch
+  - gws_gmail_search
+  - gws_gmail_read
+  - gws_gmail_draft
+  - gws_gmail_send
+  - gws_drive_search
+  - gws_drive_read
+  - gws_drive_upload
+  - gws_drive_share
+  - gws_calendar_list
+  - gws_calendar_freebusy
+  - gws_calendar_create
+  - gws_calendar_update
+  - gws_schema
 provides_hooks:
   - pre_gateway_dispatch
+  - pre_tool_call
 config_schema:
   gws_bin:
     type: str

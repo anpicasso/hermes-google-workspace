@@ -99,7 +99,7 @@ def register(ctx):
                     )
                 except (OSError, ValueError):
                     health[name] = {"stored": True, "valid": None, "state": "stored",
-                                    "reauth_required": False, "detail": "No se pudo comprobar esta cuenta."}
+                                    "reauth_required": False, "detail": "Could not check this account."}
             payload["health"] = health
         return json.dumps(payload)
 
@@ -151,6 +151,31 @@ def register(ctx):
 
     runtime = Runtime()
 
+    from .workspace_tools import SCHEMAS, build_args
+    from .api_policy import make_pre_tool_call_hook
+
+    ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(build_args, SCHEMAS))
+
+    def workspace_handler(name):
+        def handler(args, **kwargs):
+            try:
+                argv = build_args(name, args)
+                result = execute_gws(
+                    root(), args.get("account"), argv,
+                    gws_bin=ctx.get_config("gws_bin", default="gws"),
+                )
+            except ValueError as exc:
+                result = {"ok": False, "error_code": "invalid_arguments", "error": str(exc)}
+            except OSError:
+                result = {"ok": False, "error_code": "local_error",
+                          "error": "The local Workspace command could not run."}
+            return json.dumps(result)
+        return handler
+
+    for name, schema in SCHEMAS.items():
+        ctx.register_tool(name=name, toolset="gws_oauth",
+                          handler=workspace_handler(name), schema=schema)
+
     def watch_handler(service):
         def handler(args, **kwargs):
             try:
@@ -162,28 +187,28 @@ def register(ctx):
 
     ctx.register_tool(
         name="gws_login", toolset="gws_oauth", handler=login,
-        schema={"name": "gws_login", "description": "Inicia OAuth de gws para una cuenta Google en el perfil actual desde cualquier plataforma, incluyendo CLI, TUI, Desktop, API server y gateway. Úsalo tras recibir el correo y los permisos deseados. Devuelve una URL de Google. Si el navegador corre en la misma máquina que Hermes, el callback llega solo al servidor local de gws, el navegador muestra 'Success' y la cuenta queda registrada sin pegar nada: confírmalo con gws_accounts o llamando gws_login de nuevo con el mismo account y sin callback_url, que devuelve el resultado guardado una sola vez (consumed=true). Si el navegador está en otro dispositivo, pide pegar en la misma sesión la URL localhost completa, con o sin http://; el gateway la intercepta automáticamente. Si llega al agente, completa con esta misma herramienta, el mismo account y callback_url; el callback pasa por el modelo y queda en el historial. Todo fallo trae un reason estable (intercambio: invalid_callback, expired, callback_rejected, gws_failed, identity_unconfirmed, identity_mismatch, account_exists, commit_failed, internal; previo: invalid_arguments, no_session_identity, client_missing, launch_failed, pending, no_pending). identity_mismatch incluye la identidad reportada enmascarada (a***o@dominio): casi siempre es un correo mal escrito en la solicitud; verifica la ortografía exacta antes de reintentar. Para una cuenta ya configurada, usa reauthorize=true: las credenciales anteriores se conservan hasta validar la nueva identidad y solo entonces se sustituyen. Nunca solicites passwords, tokens ni códigos sueltos.",
+        schema={"name": "gws_login", "description": "Authorize one Google account for this single-operator Hermes profile on any frontend. Returns a Google consent URL; full native scopes remain the default. A browser on the Hermes host completes automatically: confirm with gws_accounts or repeat gws_login without callback_url for the one-shot stored outcome. From another device, paste the complete localhost callback URL in the originating session; gateway ingress intercepts it, otherwise finish using callback_url and the same account. Explicit callbacks pass through the model/history. Use reauthorize=true only to replace an existing account; old credentials remain until the new identity matches. Failures have stable reason codes; identity_mismatch reports a masked identity, so verify the exact requested spelling. Never request passwords, exported credentials, refresh tokens or standalone codes.",
                 "parameters": {"type": "object", "properties": {
-                    "account": {"type": "string", "description": "Correo Google exacto a autorizar"},
-                    "callback_url": {"type": "string", "description": "URL localhost completa pegada por el usuario para finalizar el login pendiente en esta misma sesión; disponible en cualquier plataforma"},
-                    "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Modo nativo de permisos de gws; full permite todos los servicios compatibles"},
-                    "scopes": {"type": "array", "items": {"type": "string"}, "description": "Scopes OAuth exactos; requerido solo con scope_mode=custom"},
-                    "reauthorize": {"type": "boolean", "default": False, "description": "Renueva una cuenta ya configurada. Es explícito: sin este flag se rechaza. Las credenciales anteriores siguen intactas hasta que la nueva identidad coincida y el commit tenga éxito; cancelar, vencer o rechazar la identidad las conserva; un fallo de reemplazo intenta restaurarlas."}},
+                    "account": {"type": "string", "description": "Exact Google email address to authorize"},
+                    "callback_url": {"type": "string", "description": "Complete localhost callback URL pasted by the user to finish this session’s pending login on any frontend"},
+                    "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Native gws scope preset; full requests all supported service scopes"},
+                    "scopes": {"type": "array", "items": {"type": "string"}, "description": "Exact OAuth scopes, required only with scope_mode=custom"},
+                    "reauthorize": {"type": "boolean", "default": False, "description": "Explicitly renew an existing account. Old credentials remain until identity validation and replacement succeed; cancellation, expiry or rejection preserves them, and replacement failure attempts rollback."}},
                     "required": ["account"]}},
     )
     ctx.register_tool(
         name="gws_accounts", toolset="gws_oauth", handler=accounts,
-        schema={"name": "gws_accounts", "description": "Lista las cuentas autorizadas en el perfil actual, sin revelar credenciales. Con check_health=true consulta gws auth status por cuenta y distingue credenciales guardadas de una sesión válida; gws sigue siendo el único responsable de refrescar tokens.",
+        schema={"name": "gws_accounts", "description": "List this operator’s Google accounts in the active profile without credentials. check_health=true obtains native status and a sanitized granted-scope summary; stored files are distinguished from confirmed validity. Native gws handles refresh.",
                 "parameters": {"type": "object", "properties": {
-                    "check_health": {"type": "boolean", "default": False, "description": "Comprobación en vivo opcional (hasta 20 s por cuenta). Devuelve state=valid|invalid|stored|unreadable, stored y valid por separado, y reauth_required. No expone stdout/stderr ni tokens."}},
+                    "check_health": {"type": "boolean", "default": False, "description": "Optional native health check (up to 20 seconds per account). Returns state=valid|invalid|stored|unreadable, stored, valid, reauth_required and safe scope metadata, never raw output or tokens."}},
                     "required": []}},
     )
     ctx.register_tool(
         name="gws_api", toolset="gws_oauth", handler=api,
-        schema={"name": "gws_api", "description": "Ejecuta gws tal cual para una cuenta explícita del perfil. Los argumentos se pasan sin limitar comandos, opciones ni acceso a archivos locales. Las respuestas exitosas mayores a 200000 caracteres devuelven output_file (archivo local UTF-8 completo) y output_bytes en vez de data; procesa ese archivo con código y elimínalo después. Para adjuntos Gmail decodifica el campo data del JSON como base64url. Si gws falla, devuelve error_code, category, action, reauth_required y exit_code con un mensaje saneado; nunca incluye stdout/stderr crudos.",
+        schema={"name": "gws_api", "description": "Advanced native Workspace API escape hatch for one explicit account. Prefer curated tools and gws_schema for common tasks. Native auth lifecycle/export is blocked; mutations, destructive operations, sends/shares and local file input/output require Hermes approval. Pass CLI tokens, not a shell command. Successful output above 200000 characters returns output_file/output_bytes: process locally and remove after use. Gmail attachment data is base64url. Native failures return sanitized error_code/category/action/reauth_required/exit_code, never raw failure output.",
                 "parameters": {"type": "object", "properties": {
-                    "account": {"type": "string", "description": "Correo exacto de una cuenta autorizada"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Argumentos exactos posteriores al ejecutable gws, por ejemplo [\"drive\",\"files\",\"list\"]"}},
+                    "account": {"type": "string", "description": "Exact email address of an authorized account"},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Exact tokens after the gws executable, for example [\"drive\",\"files\",\"list\"]"}},
                     "required": ["account", "args"]}},
     )
 

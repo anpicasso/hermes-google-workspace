@@ -23,6 +23,12 @@ If the browser runs on the same host as Hermes, the redirect reaches the `gws` l
 
 Run `gws auth status` to inspect the exact native `client_config` path on systems using a legacy location.
 
+## Account and command policy
+
+One profile belongs to one trusted operator; connect that operator’s Google accounts only. Every authorized session in the profile can use those accounts. Full OAuth scope mode remains the default; the configured client and Google consent determine what can actually be granted.
+
+Prefer curated Gmail/Drive/Calendar tools for common operations, `gws_schema` for native request discovery, and `gws_api` for the rest. Public tools refuse native auth export/login/logout/setup commands; use `gws_login` and `gws_accounts(check_health=true)` instead. Mutations, destructive operations and local file input/output use Hermes approval, not a model-supplied confirmation flag.
+
 ## Targeted watches are opt-in
 
 The Gmail/Drive/Calendar watch tools are registered after upgrade, but nothing is subscribed or started by installation. `new_session` starts need a native Hermes webhook route, and Drive/Calendar need `watch_callback_url`; Gmail needs a Pub/Sub topic and subscription. No worker starts automatically, and no Google resource is created until an explicit `gws_*_watch action=start` and the separately supervised worker run. See `docs/watch-setup.md`.

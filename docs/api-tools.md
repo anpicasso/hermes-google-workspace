@@ -1,0 +1,50 @@
+# Workspace tools and approvals
+
+One profile is one trusted operator. Every connected Google account belongs to that operator; every session authorized to use this profile can use those accounts. Choose an explicit `account` on every Workspace call. Use separate profiles and access controls for different operators.
+
+## Hybrid surface
+
+Prefer the curated tools for common jobs; use `gws_schema` to discover native request fields, then `gws_api` for operations not covered here. We do not duplicate the entire Google API surface.
+
+- Gmail: `gws_gmail_search` → `gmail users messages list`; `gws_gmail_read` → `gmail users messages get`; `gws_gmail_draft` → `gmail users drafts create`; `gws_gmail_send` → `gmail users messages send`.
+- Drive: `gws_drive_search` → `drive files list`; `gws_drive_read` → `drive files get` or `export`; `gws_drive_upload` → `drive files create`; `gws_drive_share` → `drive permissions create`.
+- Calendar: `gws_calendar_list` → `calendar events list`; `gws_calendar_freebusy` → `calendar freebusy query`; `gws_calendar_create` → `calendar events insert`; `gws_calendar_update` → `calendar events patch`.
+- Discovery: `gws_schema` → `schema <service.resource.method>`; optional `resolve_refs=true`.
+- Advanced: `gws_api(account,args)` takes exact CLI tokens, not a shell command.
+- Monitoring: the separate Gmail/Drive/Calendar watch tools are described in [watch-setup.md](watch-setup.md).
+
+Schemas reject unknown fields, invalid types, malformed mail headers, and out-of-range requests. Searches return one bounded page; pass the returned page token to continue. IDs are never repaired or guessed.
+
+## Examples
+
+These are illustrative tool calls, not operations performed during installation.
+
+```json
+{"tool":"gws_gmail_search","arguments":{"account":"me@example.com","query":"from:client@example.com newer_than:7d","max_results":10}}
+{"tool":"gws_gmail_read","arguments":{"account":"me@example.com","message_id":"MESSAGE_ID","format":"metadata","metadata_headers":["From","Subject"]}}
+{"tool":"gws_gmail_draft","arguments":{"account":"me@example.com","to":["client@example.com"],"subject":"Project update","body":"The draft is ready for review."}}
+{"tool":"gws_drive_search","arguments":{"account":"me@example.com","query":"trashed = false and name contains 'Budget'","page_size":20}}
+{"tool":"gws_drive_read","arguments":{"account":"me@example.com","file_id":"FILE_ID","mode":"export","mime_type":"application/pdf","output_path":"exports/budget.pdf"}}
+{"tool":"gws_drive_upload","arguments":{"account":"me@example.com","path":"reports/update.pdf","parent_id":"FOLDER_ID"}}
+{"tool":"gws_drive_share","arguments":{"account":"me@example.com","file_id":"FILE_ID","type":"user","role":"reader","email_address":"client@example.com","send_notification":true}}
+{"tool":"gws_calendar_freebusy","arguments":{"account":"me@example.com","time_min":"2026-12-01T09:00:00-05:00","time_max":"2026-12-01T17:00:00-05:00","calendar_ids":["primary"]}}
+{"tool":"gws_calendar_create","arguments":{"account":"me@example.com","summary":"Project review","start":"2026-12-01T10:00:00-05:00","end":"2026-12-01T10:30:00-05:00","send_updates":"none"}}
+{"tool":"gws_schema","arguments":{"account":"me@example.com","method":"drive.files.update"}}
+```
+
+Mail is plain text without attachments. Recipients must be plain email addresses, not display-name syntax. Reply threading accepts `thread_id` and `in_reply_to`; the latter sets both In-Reply-To and References. Calendar start/end must both be dates or both zoned timestamps; all-day end is exclusive. Calendar notifications default to `none`; request `send_updates="all"` explicitly when invitations should be sent. Drive user/group sharing defaults to notifying recipients.
+
+Drive binary content/export requires a relative `output_path`; upload uses a relative `path`. Paths cannot contain traversal components or start with `/` or `-`. They resolve against the native process working directory, not the plugin directory. Ensure output parent directories exist. Local file operations require approval. Shared-drive searches expose Google's `incompleteSearch` indicator; narrow the search if it is true.
+
+## Approval policy
+
+The same `pre_tool_call` hook classifies generic and curated calls before execution:
+
+- Known reads and schema/help discovery run without this additional gate.
+- Mutations (including drafts), deletes, sends, sharing, uploads and local output files request **native Hermes approval**. Unknown methods/options/helpers and most request bodies also request approval. Calendar free/busy is a known read-only POST exception.
+- The public native `auth` namespace is blocked even when invoked through the generic executor. Use `gws_login` or `gws_accounts(check_health=true)` instead. Worker-internal bounded auth is not exposed as an agent tool.
+- Model arguments such as `approved=true` cannot grant approval. Host approval mode, existing operator grants and frontend approval support determine the result; this is not an independent per-call confirmation system or an OS sandbox.
+
+Curated approval previews show readable arguments such as recipient, path and sharing role. Previews are bounded; inspect the full intended operation before approving a long generic request. A successful remote mutation followed by a local output/transport failure is not safe to blindly retry: read back the remote object first.
+
+Full OAuth remains the default. The profile's configured OAuth client, consent screen, Google policy and granted scopes govern access. `gws_accounts(check_health=true)` reports sanitized granted scopes, never exported credentials.

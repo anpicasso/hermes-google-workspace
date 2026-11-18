@@ -195,6 +195,9 @@ class Worker:
         self.poster = poster or routes.post
         self.clock = clock
         self.reconcile_seconds = int(config.get("watch_reconcile_seconds", 300))
+        self.subscription_backoff_max = int(config.get("watch_subscription_backoff_max", 900))
+        self.retention_seconds = int(config.get("watch_retention_days", 7)) * 86400
+        self._last_prune = None
         self.stopping = False
 
     # --- subscriptions ---------------------------------------------------
@@ -266,6 +269,10 @@ class Worker:
             params = {"calendarId": calendar_id}
             result = self.client.call(source["account"], ["calendar", "events", "watch"], params, body=body)
         if not result.get("ok"):
+            # Keep one diagnostic error row per source, not one per retry.
+            for old in self.store.remotes(source_id=source["source_id"]):
+                if old["kind"] == CHANNEL_KIND[service] and old["state"] == "error":
+                    self.store.remove_remote(old["remote_id"])
             self.store.add_remote(remote_id, CHANNEL_KIND[service], source_id=source["source_id"],
                                   state="error", identity={"token": token, "channel_id": channel_id},
                                   detail=result.get("error", "channel registration failed"))
@@ -284,15 +291,37 @@ class Worker:
         return True
 
     def ensure_subscription(self, source):
+        """Create/renew the Google subscription with durable bounded backoff.
+
+        The backoff lives in ``meta`` so a restart or crash loop cannot hammer
+        Google; a fresh watch start on the source clears it.
+        """
         service = source["service"]
+        key = "backoff:sub:" + source["source_id"]
+        if not self._retry_due(key):
+            return False
+        ok = False
         try:
             if service == "gmail":
-                return self._ensure_gmail(source)
-            if service in ("drive", "calendar"):
-                return self._ensure_channel(source, service)
+                ok = self._ensure_gmail(source)
+            elif service in ("drive", "calendar"):
+                ok = self._ensure_channel(source, service)
         except Exception:
             logger.warning("watch subscription failed for %s", service, exc_info=True)
-        return False
+        self._retry_outcome(key, ok)
+        return ok
+
+    def _retry_due(self, key):
+        return float(_backoff_state(self.store, key).get("next", 0)) <= self.clock()
+
+    def _retry_outcome(self, key, ok):
+        """Durable, bounded exponential backoff: one meta row per key, never growth."""
+        if ok:
+            self.store.delete_meta(key)
+            return
+        attempts = int(_backoff_state(self.store, key).get("attempts", 0)) + 1
+        delay = min(self.subscription_backoff_max, 5 * 2 ** min(attempts, 16))
+        self.store.set_meta(key, json.dumps({"attempts": attempts, "next": self.clock() + delay}))
 
     # --- delta reading ---------------------------------------------------
     def drain_source(self, source):
@@ -464,6 +493,9 @@ class Worker:
 
     # --- cleanup ---------------------------------------------------------
     def _stop_source(self, source):
+        key = "backoff:stop:" + source["source_id"]
+        if not self._retry_due(key):
+            return False
         remotes = self.store.remotes(source_id=source["source_id"])
         failed = False
         for remote in remotes:
@@ -486,7 +518,9 @@ class Worker:
                 self.store.update_remote(remote["remote_id"], state="cleanup_pending",
                                          detail=result.get("error_code", "stop failed"))
         if not failed:
-            self.store.update_source(source["source_id"], state="stopped")
+            # Conditional: a watch started during the network calls keeps the source.
+            self.store.stop_source_if_unused(source["source_id"])
+        self._retry_outcome(key, not failed)
         return not failed
 
     def cleanup(self):
@@ -528,8 +562,8 @@ class Worker:
             if not watches:
                 self._stop_source(source)
                 continue
-            if not self.ensure_subscription(source):
-                continue
+            # A failed push lease must not disable cursor reconciliation.
+            self.ensure_subscription(source)
             pending = self.store.pending_hints(source["source_id"])
             reconcile_due = ((source.get("last_reconcile") or 0) + self.reconcile_seconds
                              <= self.clock())
@@ -537,7 +571,11 @@ class Worker:
                 self.drain_source(source)
         self.cleanup()
         self.forward()
-        self.store.set_meta("worker_heartbeat", self.clock())
+        now = self.clock()
+        if self._last_prune is None or now - self._last_prune >= 3600:
+            self._last_prune = now
+            self.store.prune(now, retention_seconds=self.retention_seconds)
+        self.store.set_meta("worker_heartbeat", now)
         return {"ok": True}
 
     async def run_forever(self, *, interval=5, callback_host="127.0.0.1", callback_port=8765):
@@ -562,6 +600,14 @@ def _expiry(value):
     return number / 1000.0 if number > 10_000_000_000 else number
 
 
+def _backoff_state(store, key):
+    try:
+        value = json.loads(store.get_meta(key) or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _lock_path(home):
     return Path(home).expanduser().resolve() / "plugin-data" / "gws-oauth" / "worker.lock"
 
@@ -572,6 +618,54 @@ def _store(home):
 
 def _print(value):
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+def _lock_held(path):
+    """True when a live worker holds the profile lock (probe, never blocks)."""
+    if fcntl is None or not Path(path).exists():
+        return False if fcntl is not None else None
+    with open(path, "a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return False
+
+
+def health(store, lock_path, *, stale_seconds=60):
+    """Secret-free worker/watch diagnostics for the operator CLI."""
+    now = store.clock()
+    beat = store.get_meta("worker_heartbeat")
+    age = now - float(beat) if beat else None
+    held = _lock_held(lock_path)
+    watches = store.list_watches()
+    counts = defaultdict(int)
+    for row in watches:
+        counts[row["state"]] += 1
+    sources = []
+    for source in store.list_sources(active_only=False):
+        retries = {}
+        for kind in ("sub", "stop"):
+            state = _backoff_state(store, f"backoff:{kind}:" + source["source_id"])
+            if state.get("next"):
+                retries[kind] = {"attempts": state.get("attempts"), "next_at": W.now_iso(state["next"])}
+        sources.append({"source_id": source["source_id"], "service": source["service"],
+                        "account": source["account"], "state": source["state"],
+                        "lease_expiry": W.now_iso(source["expires_at"]) if source.get("expires_at") else None,
+                        "last_reconcile": W.now_iso(source["last_reconcile"]) if source.get("last_reconcile") else None,
+                        "last_error": source.get("last_error"),
+                        "pending_hints": len(store.pending_hints(source["source_id"])),
+                        "retry": retries or None})
+    healthy = bool(held) and age is not None and age <= stale_seconds
+    return {"ok": healthy, "worker_running": held,
+            "heartbeat": W.now_iso(float(beat)) if beat else None,
+            "heartbeat_age_seconds": int(age) if age is not None else None,
+            "stale_after_seconds": stale_seconds,
+            "watches": dict(counts),
+            "cleanup_pending": sum(1 for row in watches if row["cleanup_state"] == "pending"),
+            "routes_retained": sum(1 for row in watches if row["cleanup_state"] == "retained"),
+            "sources": sources}
 
 
 def main(argv=None):
@@ -587,13 +681,25 @@ def main(argv=None):
     run.add_argument("--callback-port", type=int, default=8765)
     run.add_argument("--interval", type=int, default=5)
     run.add_argument("--reconcile-seconds", type=int, default=300)
+    run.add_argument("--subscription-backoff-max", type=int, default=900,
+                     help="cap in seconds for failed subscription create/renew retries")
+    run.add_argument("--retention-days", type=int, default=7,
+                     help="days to keep fully cleaned terminal watch records")
     listing = sub.add_parser("list", help="list this profile's watches")
     listing.add_argument("--home", required=True)
     stop = sub.add_parser("stop", help="revoke one watch locally; the worker finishes remote cleanup")
     stop.add_argument("watch_id")
     stop.add_argument("--home", required=True)
+    status = sub.add_parser("status", help="worker heartbeat and watch/source diagnostics; "
+                                           "exit 1 when the worker is not running or stale")
+    status.add_argument("--home", required=True)
+    status.add_argument("--stale-seconds", type=int, default=60)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.command == "status":
+        report = health(_store(args.home), _lock_path(args.home), stale_seconds=args.stale_seconds)
+        _print(report)
+        return 0 if report["ok"] else 1
     if args.command == "list":
         store = _store(args.home)
         _print([W.watch_status(store, row) for row in store.list_watches()])
@@ -606,7 +712,9 @@ def main(argv=None):
     config = {"watch_callback_url": args.callback_url,
               "watch_gmail_topic": args.gmail_topic,
               "watch_gmail_subscription": args.gmail_subscription,
-              "watch_reconcile_seconds": args.reconcile_seconds}
+              "watch_reconcile_seconds": args.reconcile_seconds,
+              "watch_subscription_backoff_max": args.subscription_backoff_max,
+              "watch_retention_days": args.retention_days}
     os.environ["HERMES_HOME"] = str(Path(args.home).expanduser().resolve())
     client = GwsClient(args.home, gws_bin=args.gws_bin)
     routes = watch_routes.RouteManager(home=args.home)

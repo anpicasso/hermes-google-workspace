@@ -511,7 +511,8 @@ def drain(client, store, source, watches, *, max_pages=10):
                     continue
                 wrapper = {"calendar_id": calendar_id, "before": before, "after": meta,
                            "occurred_at": _updated_ts(meta)}
-                match(watch, wrapper, client)
+                if not match(watch, wrapper, client):
+                    continue  # e.g. a change stamped before the watch started
                 payload = render(watch, wrapper)
                 identity = json.dumps([calendar_id, meta["id"], meta.get("updated"), change],
                                       sort_keys=True)

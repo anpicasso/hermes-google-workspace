@@ -10,6 +10,11 @@ from contextlib import suppress
 from pathlib import Path
 from contextlib import contextmanager
 
+if __package__:
+    from .api_policy import BLOCK, classify
+else:
+    from api_policy import BLOCK, classify
+
 try:  # POSIX
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -88,6 +93,8 @@ _ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}\Z")
 _HTTP_STATUS = re.compile(r'"code"\s*:\s*(\d{3})')
 _HTTP_STATUS_ANY = re.compile(r'(?:\bHTTP[ /]|\bstatus[=: ]{1,3})(\d{3})\b', re.IGNORECASE)
 _HEALTH_TIMEOUT = 20
+# Scope URLs/names only; anything else in the status payload is never echoed.
+_SCOPE = re.compile(r"(?:https://www\.googleapis\.com/auth/[A-Za-z0-9._/-]{1,120}|openid|email|profile)\Z")
 
 # ponytail: fixed allowlist of native signals; never echo gws output, which may
 # contain request bodies, paths, or token fragments.
@@ -287,6 +294,14 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
     if not isinstance(status, dict):
         return {"stored": True, "valid": None, "state": "stored", "reauth_required": False,
                 "detail": "gws auth status no devolvió un estado legible; la sesión no se validó en vivo."}
+    health = _status_health(status, account)
+    scopes = status.get("scopes")
+    if isinstance(scopes, list):
+        health["scopes"] = sorted({x for x in scopes if isinstance(x, str) and _SCOPE.fullmatch(x)})
+    return health
+
+
+def _status_health(status, account):
     email = status.get("email")
     if isinstance(email, str) and email and email.lower() != account.lower():
         return {"stored": True, "valid": False, "state": "invalid", "reauth_required": True,
@@ -322,6 +337,12 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
 def execute_gws(root, account, args, *, gws_bin="gws"):
     if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
         raise ValueError("args must be a list of strings")
+    if classify(args)[0] == BLOCK:
+        # Public tool path: `auth export` prints decrypted credentials. Internal
+        # bounded_gws (watch workers, health) keeps native auth access.
+        return {"ok": False, "error_code": "auth_blocked", "category": "policy",
+                "action": "use_gws_accounts_or_gws_login", "reauth_required": False,
+                "error": "gws auth commands are not available to the agent; use gws_accounts with check_health=true or gws_login."}
     try:
         with _native_guard(root, account):
             path = account_dir(root, account)
