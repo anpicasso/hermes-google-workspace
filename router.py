@@ -1,5 +1,6 @@
 """Run gws using exactly one account under the current Hermes profile."""
 from __future__ import annotations
+import hashlib
 import json
 import os
 import re
@@ -8,7 +9,6 @@ import tempfile
 from contextlib import suppress
 from pathlib import Path
 from contextlib import contextmanager
-import threading
 
 try:  # POSIX
     import fcntl
@@ -19,38 +19,74 @@ try:  # Windows
 except ImportError:  # pragma: no cover - POSIX
     msvcrt = None
 
-_COMMIT_THREAD_LOCK = threading.Lock()
-
 @contextmanager
-def _commit_lock(accounts):
-    """Serialize native calls and account swaps across threads and processes.
+def _commit_lock(accounts, *, shared=False):
+    """Serialize account swaps across threads and processes.
 
-    ponytail: profile file lock plus global thread lock; use per-account locks
-    if contention is measurable. Native calls hold the lock until completion.
+    Exclusive (default) is the profile-wide swap barrier used by OAuth installs.
+    Native reads take it *shared* and then a per-account lock, so different
+    accounts can run in parallel while an account swap still drains every reader
+    before it renames a credential directory.
+
+    ponytail: one profile-wide flock plus one lock per account; shard further only
+    if profile-wide shared-lock contention is measurable.
     """
     accounts.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(accounts / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
-    with _COMMIT_THREAD_LOCK:
-        try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            elif msvcrt is not None:  # pragma: no cover - Windows
-                os.lseek(fd, 0, os.SEEK_SET)
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"\0")
-                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
+    try:
+        # Separate open descriptions serialize threads too. Never hold a Python
+        # mutex across blocking flock: another thread needs to release its fd.
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
+        else:
+            raise OSError("No supported credential lock backend")
+        yield
+    finally:
+        # Closing also releases the OS lock, including on acquisition failure.
+        os.close(fd)
+
+
+@contextmanager
+def _account_lock(root, account):
+    """Cross-process lock for exactly one account, outside its credential dir."""
+    if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
+        raise ValueError("Invalid account name")
+    directory = Path(root).resolve() / ".locks"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    name = hashlib.sha256(account.encode("utf-8")).hexdigest()[:32]
+    fd = os.open(directory / f"{name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
+        else:
+            raise OSError("No supported credential lock backend")
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _native_guard(root, account):
+    """Shared swap barrier + one account lock for the whole native call."""
+    root = Path(root).resolve()
+    with _commit_lock(root / "accounts", shared=True):
+        with _account_lock(root, account):
             yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            elif msvcrt is not None:  # pragma: no cover - Windows
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
-            os.close(fd)
 
 
 _ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}\Z")
 _HTTP_STATUS = re.compile(r'"code"\s*:\s*(\d{3})')
+_HTTP_STATUS_ANY = re.compile(r'(?:\bHTTP[ /]|\bstatus[=: ]{1,3})(\d{3})\b', re.IGNORECASE)
 _HEALTH_TIMEOUT = 20
 
 # ponytail: fixed allowlist of native signals; never echo gws output, which may
@@ -96,8 +132,8 @@ def _account_env(path):
     return env
 
 
-def _failure(code, message, action, *, category, reauth_required, returncode):
-    return {
+def _failure(code, message, action, *, category, reauth_required, returncode, http_status=None):
+    failure = {
         "error_code": code,
         "category": category,
         "error": message,
@@ -105,6 +141,14 @@ def _failure(code, message, action, *, category, reauth_required, returncode):
         "reauth_required": reauth_required,
         "exit_code": returncode,
     }
+    if http_status is not None:
+        failure["http_status"] = int(http_status)
+    return failure
+
+
+def _http_status(text):
+    match = _HTTP_STATUS.search(text) or _HTTP_STATUS_ANY.search(text)
+    return int(match.group(1)) if match else None
 
 
 def classify_gws_failure(returncode, stdout="", stderr=""):
@@ -114,49 +158,69 @@ def classify_gws_failure(returncode, stdout="", stderr=""):
     returned: they can contain request bodies, file paths, or token fragments.
     """
     text = (stdout + "\n" + stderr).lower()
+    status = _http_status(stdout + "\n" + stderr)
     if returncode == 3:
         return _failure(
             "invalid_arguments",
             "gws rechazó los argumentos (sintaxis o validación); revisa el comando y sus opciones.",
             "check_args", category="syntax", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
     if re.search(r"\binvalid_rapt\b", text):
         return _failure(
             "invalid_rapt",
             "Google exige reautenticar la cuenta (invalid_rapt); usa gws_login con reauthorize=true.",
             "reauthorize", category="auth", reauth_required=True, returncode=returncode,
+            http_status=status,
         )
     if re.search(r"\binvalid_grant\b", text):
         return _failure(
             "invalid_grant",
             "La autorización de Google ya no es válida (invalid_grant); usa gws_login con reauthorize=true.",
             "reauthorize", category="auth", reauth_required=True, returncode=returncode,
+            http_status=status,
         )
     if any(marker in text for marker in _PERMISSION_MARKERS):
         return _failure(
             "permission_denied",
             "Google denegó el permiso; revisa los scopes concedidos y que la API necesaria esté habilitada.",
             "check_scopes_or_api", category="permission", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
-    status_match = _HTTP_STATUS.search(stdout)
-    status = int(status_match.group(1)) if status_match else None
     if status == 401:
         return _failure(
             "unauthenticated",
             "Google rechazó la autenticación (HTTP 401); reautoriza la cuenta.",
             "reauthorize", category="auth", reauth_required=True, returncode=returncode,
+            http_status=status,
         )
     if status == 403:
         return _failure(
             "permission_denied",
             "Google denegó el permiso (HTTP 403); revisa los scopes concedidos y que la API necesaria esté habilitada.",
             "check_scopes_or_api", category="permission", reauth_required=False, returncode=returncode,
+            http_status=status,
+        )
+    if status == 429:
+        return _failure(
+            "rate_limited",
+            "Google limitó la tasa de solicitudes (HTTP 429); reintenta con retroceso.",
+            "retry", category="api", reauth_required=False, returncode=returncode,
+            http_status=status,
+        )
+    if status == 410:
+        return _failure(
+            "gone",
+            "El cursor de sincronización venció (HTTP 410); se requiere una resincronización.",
+            "resync", category="api", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
     if returncode == 2:
         return _failure(
             "auth_unavailable",
             "gws no pudo autenticar; comprueba el estado de la cuenta y la conectividad antes de reautorizar.",
             "check_account_health", category="auth", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
     if returncode == 1:
         suffix = f" (HTTP {status})" if status else ""
@@ -164,34 +228,39 @@ def classify_gws_failure(returncode, stdout="", stderr=""):
             "api_error",
             f"gws devolvió un error de API{suffix}; revisa los argumentos y el recurso solicitado.",
             "check_request", category="api", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
     if returncode == 4:
         return _failure(
             "discovery_error",
             "No se pudo cargar el esquema de la API de Google; revisa la red o reintenta.",
             "retry_or_check_network", category="discovery", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
     if returncode == 5:
         return _failure(
             "internal_error",
             "gws falló internamente; reintenta la operación.",
             "retry", category="internal", reauth_required=False, returncode=returncode,
+            http_status=status,
         )
     return _failure(
         "gws_error",
         f"gws terminó con estado {returncode}; no se pudo clasificar el error.",
         "inspect_native_gws", category="unknown", reauth_required=False, returncode=returncode,
+        http_status=status,
     )
 
 
 def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
     """Ask native gws whether stored credentials still authenticate.
 
-    The plugin never decrypts credentials and never refreshes tokens itself;
-    gws owns that behavior. Output is reduced to fixed states and messages.
+    This health path leaves decryption and refresh to native gws. Output is
+    reduced to fixed states and messages. The Pub/Sub worker has a separate,
+    documented memory-only export/refresh transport in watch_pubsub.py.
     """
     try:
-        with _commit_lock(Path(root).resolve() / "accounts"):
+        with _native_guard(root, account):
             path = account_dir(root, account)
             result = subprocess.run(
                 [gws_bin, "auth", "status"], env=_account_env(path),
@@ -254,7 +323,7 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
     if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
         raise ValueError("args must be a list of strings")
     try:
-        with _commit_lock(Path(root).resolve() / "accounts"):
+        with _native_guard(root, account):
             path = account_dir(root, account)
             result = subprocess.run(
                 [gws_bin, *args], env=_account_env(path),
@@ -289,4 +358,46 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
         data = result.stdout.strip()
+    return {"ok": True, "account": account, "data": data}
+
+
+def bounded_gws(root, account, args, *, gws_bin="gws", timeout=30, max_output=1_000_000):
+    """One bounded native call for background readers.
+
+    Unlike ``execute_gws`` this never spills large output to a file, never
+    returns raw failure text, and exposes a numeric HTTP status for 404/410/429
+    handling. The subprocess is killed and reaped before the locks release.
+    """
+    if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
+        raise ValueError("args must be a list of strings")
+    try:
+        with _native_guard(root, account):
+            path = account_dir(root, account)
+            result = subprocess.run(
+                [gws_bin, *args], env=_account_env(path),
+                capture_output=True, text=True, timeout=timeout,
+            )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error_code": "timeout", "retryable": True,
+                "error": "La llamada nativa excedió el plazo; reintenta."}
+    except (OSError, ValueError):
+        return {"ok": False, "error_code": "transport_unavailable", "retryable": True,
+                "error": "gws no está disponible o la cuenta no pertenece a este perfil."}
+    if result.returncode:
+        failure = classify_gws_failure(result.returncode, result.stdout, result.stderr)
+        status = failure.get("http_status")
+        failure["retryable"] = bool(
+            status == 429 or (isinstance(status, int) and 500 <= status <= 599)
+            or failure["error_code"] in {"timeout", "transport_unavailable", "rate_limited"}
+        )
+        return {"ok": False, **failure}
+    if len(result.stdout) > max_output:
+        return {"ok": False, "error_code": "output_too_large", "retryable": False,
+                "error": "La respuesta nativa excedió el límite de metadatos del worker."}
+    try:
+        # Native no-content methods (including Gmail users.stop) emit no JSON.
+        data = json.loads(result.stdout) if result.stdout.strip() else {}
+    except json.JSONDecodeError:
+        return {"ok": False, "error_code": "invalid_response", "retryable": True,
+                "error": "gws devolvió una respuesta que no es JSON."}
     return {"ok": True, "account": account, "data": data}
