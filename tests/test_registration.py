@@ -136,6 +136,7 @@ class RegistrationTests(unittest.TestCase):
             for state, cleanup in (("active", "none"), ("matched", "done"), ("stopped", "pending")):
                 store.update_watch("logout-test", state=state, cleanup_state=cleanup)
                 self.assertEqual(json.loads(logout({"account": "user@example.com"}))["error_code"], "watches_active")
+                self.assertEqual(json.loads(logout({"account": "User@Example.com"}))["error_code"], "watches_active")
                 self.assertTrue((account / "credentials.enc").exists())
             store.update_watch("logout-test", state="stopped", cleanup_state="done")
             result = json.loads(logout({"account": "user@example.com"}))

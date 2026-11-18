@@ -59,6 +59,20 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(broken(tool_name="gws_x", args={})["action"], "block")
 
 
+    def test_typed_preview_never_hides_recipients_behind_long_body(self):
+        import workspace_tools as w
+        hook = make_pre_tool_call_hook(w.build_args, w.SCHEMAS)
+        args = {"account": "me@example.com", "to": ["boss@example.com"], "subject": "hi",
+                "body": "x" * 5000, "bcc": ["hidden@example.org"]}
+        message = hook(tool_name="gws_gmail_send", args=args)["message"]
+        self.assertIn("hidden@example.org", message)
+        self.assertIn("(5000 chars)", message)
+        self.assertLess(len(message), 1000)
+        long_api = hook(tool_name="gws_api", args={"account": "me@example.com",
+                        "args": ["drive", "files", "delete", "--params", "y" * 3000]})["message"]
+        self.assertIn("truncated", long_api)
+
+
 @unittest.skipUnless((HOST / "model_tools.py").is_file(), "installed Hermes host source not found")
 class HostDispatchTests(unittest.TestCase):
     """Real model_tools.handle_function_call -> pre_tool_call -> request_tool_approval."""

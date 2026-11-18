@@ -118,6 +118,15 @@ def account_dir(root, account):
     return path
 
 
+def files_dir(root):
+    """Private working directory for local file input/output of public tools."""
+    path = Path(root).resolve() / "files"
+    if path.is_symlink():
+        raise OSError("Refusing a symlinked files directory")
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
 def list_accounts(root):
     base = Path(root).resolve() / "accounts"
     if not base.is_dir():
@@ -198,63 +207,63 @@ def classify_gws_failure(returncode, stdout="", stderr=""):
     if returncode == 3:
         return _failure(
             "invalid_arguments",
-            "gws rechazó los argumentos (sintaxis o validación); revisa el comando y sus opciones.",
+            "gws rejected the arguments (syntax or validation); check the command and its options.",
             "check_args", category="syntax", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if re.search(r"\binvalid_rapt\b", text):
         return _failure(
             "invalid_rapt",
-            "Google exige reautenticar la cuenta (invalid_rapt); usa gws_login con reauthorize=true.",
+            "Google requires the account to reauthenticate (invalid_rapt); use gws_login with reauthorize=true.",
             "reauthorize", category="auth", reauth_required=True, returncode=returncode,
             http_status=status,
         )
     if re.search(r"\binvalid_grant\b", text):
         return _failure(
             "invalid_grant",
-            "La autorización de Google ya no es válida (invalid_grant); usa gws_login con reauthorize=true.",
+            "The Google authorization is no longer valid (invalid_grant); use gws_login with reauthorize=true.",
             "reauthorize", category="auth", reauth_required=True, returncode=returncode,
             http_status=status,
         )
     if any(marker in text for marker in _PERMISSION_MARKERS):
         return _failure(
             "permission_denied",
-            "Google denegó el permiso; revisa los scopes concedidos y que la API necesaria esté habilitada.",
+            "Google denied permission; check the granted scopes and that the required API is enabled.",
             "check_scopes_or_api", category="permission", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if status == 401:
         return _failure(
             "unauthenticated",
-            "Google rechazó la autenticación (HTTP 401); reautoriza la cuenta.",
+            "Google rejected authentication (HTTP 401); reauthorize the account.",
             "reauthorize", category="auth", reauth_required=True, returncode=returncode,
             http_status=status,
         )
     if status == 403:
         return _failure(
             "permission_denied",
-            "Google denegó el permiso (HTTP 403); revisa los scopes concedidos y que la API necesaria esté habilitada.",
+            "Google denied permission (HTTP 403); check the granted scopes and that the required API is enabled.",
             "check_scopes_or_api", category="permission", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if status == 429:
         return _failure(
             "rate_limited",
-            "Google limitó la tasa de solicitudes (HTTP 429); reintenta con retroceso.",
+            "Google rate-limited the request (HTTP 429); retry with backoff.",
             "retry", category="api", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if status == 410:
         return _failure(
             "gone",
-            "El cursor de sincronización venció (HTTP 410); se requiere una resincronización.",
+            "The sync cursor expired (HTTP 410); a full resync is required.",
             "resync", category="api", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if returncode == 2:
         return _failure(
             "auth_unavailable",
-            "gws no pudo autenticar; comprueba el estado de la cuenta y la conectividad antes de reautorizar.",
+            "gws could not authenticate; check account health and connectivity before reauthorizing.",
             "check_account_health", category="auth", reauth_required=False, returncode=returncode,
             http_status=status,
         )
@@ -262,27 +271,27 @@ def classify_gws_failure(returncode, stdout="", stderr=""):
         suffix = f" (HTTP {status})" if status else ""
         return _failure(
             "api_error",
-            f"gws devolvió un error de API{suffix}; revisa los argumentos y el recurso solicitado.",
+            f"gws returned an API error{suffix}; check the arguments and the requested resource.",
             "check_request", category="api", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if returncode == 4:
         return _failure(
             "discovery_error",
-            "No se pudo cargar el esquema de la API de Google; revisa la red o reintenta.",
+            "Could not load the Google API schema; check the network or retry.",
             "retry_or_check_network", category="discovery", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     if returncode == 5:
         return _failure(
             "internal_error",
-            "gws falló internamente; reintenta la operación.",
+            "gws failed internally; retry the operation.",
             "retry", category="internal", reauth_required=False, returncode=returncode,
             http_status=status,
         )
     return _failure(
         "gws_error",
-        f"gws terminó con estado {returncode}; no se pudo clasificar el error.",
+        f"gws exited with status {returncode}; the error could not be classified.",
         "inspect_native_gws", category="unknown", reauth_required=False, returncode=returncode,
         http_status=status,
     )
@@ -304,10 +313,10 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
             )
     except subprocess.TimeoutExpired:
         return {"stored": True, "valid": None, "state": "stored", "reauth_required": False,
-                "detail": "gws auth status tardó demasiado; la sesión no se validó en vivo."}
+                "detail": "gws auth status timed out; the session was not validated live."}
     except OSError:
         return {"stored": True, "valid": None, "state": "stored", "reauth_required": False,
-                "detail": "No se pudo ejecutar gws auth status; la sesión no se validó en vivo."}
+                "detail": "Could not run gws auth status; the session was not validated live."}
     if result.returncode:
         failure = classify_gws_failure(result.returncode, result.stdout, result.stderr)
         invalid = bool(failure["reauth_required"])
@@ -322,7 +331,7 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
         status = None
     if not isinstance(status, dict):
         return {"stored": True, "valid": None, "state": "stored", "reauth_required": False,
-                "detail": "gws auth status no devolvió un estado legible; la sesión no se validó en vivo."}
+                "detail": "gws auth status returned no readable state; the session was not validated live."}
     health = _status_health(status, account)
     scopes = status.get("scopes")
     if isinstance(scopes, list):
@@ -334,16 +343,16 @@ def _status_health(status, account):
     email = status.get("email")
     if isinstance(email, str) and email and email.lower() != account.lower():
         return {"stored": True, "valid": False, "state": "invalid", "reauth_required": True,
-                "detail": "gws tiene credenciales de otra identidad; reautoriza esta cuenta.",
+                "detail": "gws holds credentials for another identity; reauthorize this account.",
                 "error_code": "identity_mismatch", "action": "reauthorize"}
     if status.get("credentials_readable") is False:
         return {"stored": True, "valid": False, "state": "unreadable", "reauth_required": True,
-                "detail": "Las credenciales guardadas no se pueden leer; reautoriza esta cuenta.",
+                "detail": "The stored credentials cannot be read; reauthorize this account.",
                 "error_code": "credentials_unreadable", "action": "reauthorize"}
     token_valid = status.get("token_valid")
     if token_valid is True:
         return {"stored": True, "valid": True, "state": "valid", "reauth_required": False,
-                "detail": "gws confirmó una sesión válida."}
+                "detail": "gws confirmed a valid session."}
     if status.get("token_error"):
         failure = classify_gws_failure(2, json.dumps(status["token_error"]))
         invalid = failure["reauth_required"]
@@ -353,14 +362,14 @@ def _status_health(status, account):
                 "action": failure["action"]}
     if token_valid is False:
         return {"stored": True, "valid": False, "state": "invalid", "reauth_required": True,
-                "detail": "gws informó que la sesión no es válida; reautoriza esta cuenta.",
+                "detail": "gws reported the session is invalid; reauthorize this account.",
                 "error_code": "token_invalid", "action": "reauthorize"}
     if status.get("auth_method") == "none":
         return {"stored": True, "valid": False, "state": "invalid", "reauth_required": True,
-                "detail": "gws no reconoce una sesión en esta cuenta; reautoriza esta cuenta.",
+                "detail": "gws found no session for this account; reauthorize this account.",
                 "error_code": "auth_missing", "action": "reauthorize"}
     return {"stored": True, "valid": None, "state": "stored", "reauth_required": False,
-            "detail": "Credenciales presentes; gws auth status no confirmó una sesión válida."}
+            "detail": "Credentials present; gws auth status did not confirm a valid session."}
 
 
 def execute_gws(root, account, args, *, gws_bin="gws"):
@@ -375,12 +384,14 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
     try:
         with _native_guard(root, account):
             path = account_dir(root, account)
+            # Relative --output/--upload paths land here, never in the gateway's cwd.
+            files = files_dir(root)
             result = subprocess.run(
-                [gws_bin, *args], env=_account_env(path),
+                [gws_bin, *args], env=_account_env(path), cwd=files,
                 capture_output=True, text=True, timeout=90,
             )
     except (OSError, subprocess.TimeoutExpired):
-        return {"ok": False, "error": "gws no está disponible o tardó demasiado"}
+        return {"ok": False, "error": "gws is unavailable or timed out"}
     if result.returncode:
         return {"ok": False, **classify_gws_failure(result.returncode, result.stdout, result.stderr)}
     if len(result.stdout) > 200_000:
@@ -394,7 +405,7 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
                 handle.write(result.stdout)
             return {"ok": True, "account": account, "output_file": str(output),
                     "output_bytes": output.stat().st_size, "output_encoding": "utf-8",
-                    "detail": "Salida completa guardada localmente; léela con código. Si es un adjunto Gmail, decodifica el campo JSON data como base64url. Elimina el archivo y su directorio al terminar."}
+                    "detail": "Full output saved locally; process it with code. For a Gmail attachment, decode the JSON data field as base64url. Delete the file and its directory when done."}
         except OSError:
             if output is not None:
                 with suppress(OSError):
@@ -403,7 +414,7 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
                 with suppress(OSError):
                     directory.rmdir()
             return {"ok": False, "error_code": "output_write_failed",
-                    "error": "gws terminó correctamente, pero no se pudo guardar la salida grande. Revisa el espacio y permisos locales; no repitas una escritura remota sin comprobarla."}
+                    "error": "gws succeeded, but the large output could not be saved. Check local space and permissions; do not repeat a remote write without verifying it."}
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -429,10 +440,10 @@ def bounded_gws(root, account, args, *, gws_bin="gws", timeout=30, max_output=1_
             )
     except subprocess.TimeoutExpired:
         return {"ok": False, "error_code": "timeout", "retryable": True,
-                "error": "La llamada nativa excedió el plazo; reintenta."}
+                "error": "The native call timed out; retry."}
     except (OSError, ValueError):
         return {"ok": False, "error_code": "transport_unavailable", "retryable": True,
-                "error": "gws no está disponible o la cuenta no pertenece a este perfil."}
+                "error": "gws is unavailable or the account does not belong to this profile."}
     if result.returncode:
         failure = classify_gws_failure(result.returncode, result.stdout, result.stderr)
         status = failure.get("http_status")
@@ -443,11 +454,11 @@ def bounded_gws(root, account, args, *, gws_bin="gws", timeout=30, max_output=1_
         return {"ok": False, **failure}
     if len(result.stdout) > max_output:
         return {"ok": False, "error_code": "output_too_large", "retryable": False,
-                "error": "La respuesta nativa excedió el límite de metadatos del worker."}
+                "error": "The native response exceeded the worker metadata limit."}
     try:
         # Native no-content methods (including Gmail users.stop) emit no JSON.
         data = json.loads(result.stdout) if result.stdout.strip() else {}
     except json.JSONDecodeError:
         return {"ok": False, "error_code": "invalid_response", "retryable": True,
-                "error": "gws devolvió una respuesta que no es JSON."}
+                "error": "gws returned a non-JSON response."}
     return {"ok": True, "account": account, "data": data}

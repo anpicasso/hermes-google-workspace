@@ -34,7 +34,7 @@ These are illustrative tool calls, not operations performed during installation.
 
 Mail is plain text without attachments. Recipients must be plain email addresses, not display-name syntax. Reply threading accepts `thread_id` and `in_reply_to`; the latter sets both In-Reply-To and References. Calendar start/end must both be dates or both zoned timestamps; all-day end is exclusive. Calendar notifications default to `none`; request `send_updates="all"` explicitly when invitations should be sent. Drive user/group sharing defaults to notifying recipients.
 
-Drive binary content/export requires a relative `output_path`; upload uses a relative `path`. Paths cannot contain traversal components or start with `/` or `-`. They resolve against the native process working directory, not the plugin directory. Ensure output parent directories exist. Local file operations require approval. Shared-drive searches expose Google's `incompleteSearch` indicator; narrow the search if it is true.
+Drive binary content/export requires a relative `output_path`; upload uses a relative `path`. Paths cannot contain traversal components or start with `/` or `-`. They resolve inside the private `<HERMES_HOME>/gws-oauth/files/` directory (mode 0700), never the gateway's working directory. Ensure output parent directories exist there; put upload sources there first. Local file operations require approval. Shared-drive searches expose Google's `incompleteSearch` indicator; narrow the search if it is true.
 
 ## Approval policy
 
@@ -45,6 +45,6 @@ The same `pre_tool_call` hook classifies generic and curated calls before execut
 - The public native `auth` namespace is blocked even when invoked through the generic executor. Use `gws_login` or `gws_accounts(check_health=true)` instead. Worker-internal bounded auth is not exposed as an agent tool.
 - Model arguments such as `approved=true` cannot grant approval. Host approval mode, existing operator grants and frontend approval support determine the result; this is not an independent per-call confirmation system or an OS sandbox.
 
-Curated approval previews show readable arguments such as recipient, path and sharing role. Previews are bounded; inspect the full intended operation before approving a long generic request. A successful remote mutation followed by a local output/transport failure is not safe to blindly retry: read back the remote object first.
+Curated approval previews always show recipients, attendees, share targets and paths in full; only body/description/message text is shortened. Generic `gws_api` previews are bounded and marked when truncated; inspect the full intended operation before approving a long generic request. A successful remote mutation followed by a local output/transport failure is not safe to blindly retry: read back the remote object first.
 
 Full OAuth remains the default. The profile's configured OAuth client, consent screen, Google policy and granted scopes govern access. `gws_accounts(check_health=true)` reports sanitized granted scopes, never exported credentials.

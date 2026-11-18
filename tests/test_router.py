@@ -41,6 +41,21 @@ class RouterTests(unittest.TestCase):
             self.assertTrue(saved.is_relative_to(Path(tmp)))
             self.assertNotIn("data", result)
 
+    def test_public_calls_run_in_private_files_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _account(tmp)
+            with mock.patch("router.subprocess.run", return_value=mock.Mock(
+                returncode=0, stdout="{}", stderr="")) as run:
+                execute_gws(tmp, "person@example.com", ["drive", "files", "list"])
+            files = Path(tmp).resolve() / "files"
+            self.assertEqual(run.call_args.kwargs["cwd"], files)
+            self.assertEqual(files.stat().st_mode & 0o777, 0o700)
+            files.rmdir()
+            files.symlink_to(tmp)
+            with mock.patch("router.subprocess.run") as run:
+                self.assertFalse(execute_gws(tmp, "person@example.com", ["drive", "files", "list"])["ok"])
+                run.assert_not_called()
+
     def test_large_failure_is_not_saved(self):
         with tempfile.TemporaryDirectory() as tmp:
             _account(tmp)

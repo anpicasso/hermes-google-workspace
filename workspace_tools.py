@@ -100,9 +100,9 @@ SCHEMAS = {s["name"]: s for s in (
         "mode": {"type": "string", "enum": ["metadata", "content", "export"], "default": "metadata",
                  "description": "What to read"},
         "mime_type": _S(192, "Export MIME type; required with mode=export", pattern=_MIME),
-        "output_path": _S(1024, "Path relative to the gws working directory, no '..'; required with mode=content or export", pattern=_REL_PATH)},
+        "output_path": _S(1024, "Path relative to the profile's gws-oauth/files directory, no '..'; required with mode=content or export", pattern=_REL_PATH)},
         ["file_id"]),
-    _tool("gws_drive_upload", "Upload a local file as a new Drive file. gws only accepts paths inside its working directory.", {
+    _tool("gws_drive_upload", "Upload a local file as a new Drive file. path is relative to the profile's gws-oauth/files directory.", {
         "account": ACCOUNT, "path": _S(1024, "Relative local path, no '..'", pattern=_REL_PATH),
         "name": _S(1024, "Drive name; default the local file name"),
         "parent_id": _S(256, "Destination folder ID", pattern=_ID),

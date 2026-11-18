@@ -77,6 +77,24 @@ def classify(argv):
     return ALLOW, op
 
 
+_LONG_TEXT = ("body", "description", "message")
+
+
+def _typed_preview(args, limit=300):
+    """Recipients, targets and paths always shown in full; only free text is shortened."""
+    shown = {k: v for k, v in args.items() if k not in _LONG_TEXT}
+    for key in _LONG_TEXT:
+        if key in args:
+            text = str(args[key])
+            shown[key] = text if len(text) <= limit else f"{text[:limit]}… ({len(text)} chars)"
+    return json.dumps(shown, ensure_ascii=False)
+
+
+def _argv_preview(argv, limit=1500):
+    text = json.dumps(argv, ensure_ascii=False)
+    return text if len(text) <= limit else f"{text[:limit]}… (truncated, {len(text)} chars)"
+
+
 def make_pre_tool_call_hook(build_args=None, typed_names=()):
     """Hermes ``pre_tool_call`` callback for ``gws_api`` and typed tools.
 
@@ -109,10 +127,7 @@ def make_pre_tool_call_hook(build_args=None, typed_names=()):
                 "use gws_accounts check_health or gws_login." if op == "auth"
                 else "gws args must be a list of strings.")}
         account = str(args.get("account") or "?")[:128]
-        # Typed inputs show recipients/paths plainly rather than opaque MIME base64.
-        preview = json.dumps(args if tool_name in typed else argv, ensure_ascii=False)
-        if len(preview) > 1500:
-            preview = preview[:1500] + "…"
+        preview = _typed_preview(args) if tool_name in typed else _argv_preview(argv)
         return {"action": "approve", "rule_key": f"gws:{account}:{op}"[:300],
                 "message": f"Google Workspace {op} as {account}: gws {preview}"}
 

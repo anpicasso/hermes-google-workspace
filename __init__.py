@@ -162,6 +162,7 @@ def register(ctx):
         account = args.get("account")
         if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
             return json.dumps({"ok": False, "error_code": "invalid_arguments"})
+        account = account.lower()  # slots and watches are stored lowercase
         if get_hermes_home().resolve() != install_root.parent.resolve():
             return json.dumps({"ok": False, "error_code": "profile_mismatch"})
         try:
