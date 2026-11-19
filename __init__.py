@@ -1,15 +1,14 @@
-"""Hermes plugin: per-profile Google Workspace CLI accounts, OAuth and targeted watches."""
+"""Profile-scoped Workspace tools. Native gws owns credentials and refresh."""
 import json
 
-from .oauth import LoginManager
-from .router import _ACCOUNT, account_health, bounded_gws, execute_gws, list_accounts, logout_account
+from .router import _ACCOUNT, account_health, bounded_gws, execute_gws, list_accounts
 
 
 class _PluginClient:
     """Bound native gws transport for the three watch tools."""
 
     def __init__(self, home, gws_bin):
-        self.root = home / "gws-oauth"
+        self.root = home / "gws-oauth"  # Preserve existing account slots during migration.
         self.gws_bin = gws_bin
 
     def call(self, account, args, params=None, body=None, timeout=30):
@@ -35,90 +34,42 @@ class _PluginClient:
         if not result.get("ok") or not isinstance(result.get("data"), dict):
             return None
         project = result["data"].get("project_id") or result["data"].get("project")
-        return str(project) if isinstance(project, str) and project else None
+        return project if isinstance(project, str) and project else None
 
 
 def register(ctx):
     from hermes_constants import get_hermes_home
-    from gateway.session_context import get_session_env
-    try:
-        from gateway.session_context import bound_session_key
-    except ImportError:  # older host/test double: no process-global fallback in production
-        def bound_session_key():
-            return get_session_env("HERMES_SESSION_KEY") or ""
-
     from . import watch as W
     from . import watch_calendar, watch_drive, watch_gmail, watch_routes, watch_tools
+    from .session_origin import OriginBindings
+    from .workspace_tools import SCHEMAS, build_args
+    from .api_policy import make_pre_tool_call_hook
 
-    install_root = get_hermes_home() / "gws-oauth"
-    if install_root.is_symlink():
-        raise RuntimeError(f"Refusing symlinked gws-oauth directory: {install_root}")
-    install_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    install_root.chmod(0o700)
-
-    manager = LoginManager()
-    ctx.on_unload(manager.close)
+    home = get_hermes_home().resolve()
+    profile = getattr(ctx, "profile_name", None) or "default"
+    bindings = OriginBindings()
 
     def root():
-        return get_hermes_home() / "gws-oauth"
+        if get_hermes_home().resolve() != home:
+            raise W.WatchError("profile_mismatch", "Workspace runtime belongs to another profile")
+        return home / "gws-oauth"
 
-    def login(args, **kwargs):
-        platform = get_session_env("HERMES_SESSION_PLATFORM") or get_session_env("HERMES_SESSION_SOURCE") or "cli"
-        chat = get_session_env("HERMES_SESSION_CHAT_ID")
-        user = get_session_env("HERMES_SESSION_USER_ID")
-        profile = get_session_env("HERMES_SESSION_PROFILE")
-        gateway_chat = bool(chat)
-        if not gateway_chat:
-            chat = kwargs.get("session_id") or get_session_env("HERMES_SESSION_ID")
-            user = user or "local"
-        action = args.get("action", "start")
-        if action not in ("start", "status", "cancel") or (
-                action != "start" and args.get("callback_url") is not None):
-            return json.dumps({"ok": False, "reason": "invalid_arguments"})
-        if action in ("status", "cancel"):
-            return json.dumps(getattr(manager, action)(
-                root(), platform, chat, user, args.get("account"), profile=profile))
-        if args.get("callback_url") is not None:
-            return json.dumps(manager.finish(
-                root(), platform, chat, user, args.get("account"), args["callback_url"],
-                profile=profile,
-            ))
-        result = manager.start(
-            root(), platform, chat, user, args.get("account"),
-            ctx.get_config("gws_bin", default="gws"),
-            (lambda callback: ctx.register_hook("pre_gateway_dispatch", callback)) if gateway_chat else None,
-            profile=profile,
-            scope_mode=args.get("scope_mode", "full"),
-            scopes=args.get("scopes"),
-            reauthorize=args.get("reauthorize", False),
-        )
-        return json.dumps(result)
-
-    def accounts(args, **kwargs):
-        names = list_accounts(root())
-        payload = {"ok": True, "accounts": names}
-        if args.get("check_health"):
-            health = {}
-            for name in names:
-                try:
-                    health[name] = account_health(
-                        root(), name, gws_bin=ctx.get_config("gws_bin", default="gws"),
-                    )
-                except (OSError, ValueError):
-                    health[name] = {"stored": True, "valid": None, "state": "stored",
-                                    "reauth_required": False, "detail": "Could not check this account."}
-            payload["health"] = health
-        return json.dumps(payload)
-
-    def api(args, **kwargs):
-        try:
-            result = execute_gws(
-                root(), args.get("account"), args.get("args"),
-                gws_bin=ctx.get_config("gws_bin", default="gws"),
-            )
-        except (OSError, ValueError) as exc:
-            result = {"ok": False, "error": str(exc)}
-        return json.dumps(result)
+    def safe(handler):
+        def wrapped(args, **kwargs):
+            try:
+                root()
+                if not isinstance(args, dict):
+                    raise W.WatchError("invalid_arguments", "Arguments must be an object")
+                return json.dumps(handler(args, **kwargs))
+            except W.WatchError as exc:
+                return json.dumps({"ok": False, "error_code": exc.code, "error": exc.message})
+            except ValueError:
+                return json.dumps({"ok": False, "error_code": "invalid_arguments",
+                                   "error": "Invalid Workspace arguments"})
+            except Exception:
+                return json.dumps({"ok": False, "error_code": "local_error",
+                                   "error": "Workspace operation could not complete safely"})
+        return wrapped
 
     class Runtime:
         def __init__(self):
@@ -127,133 +78,113 @@ def register(ctx):
 
         @property
         def store(self):
+            root()
             if self._store is None:
-                self._store = W.WatchStore(install_root.parent)
+                self._store = W.WatchStore(home)
             return self._store
 
         @property
         def client(self):
-            return _PluginClient(install_root.parent, ctx.get_config("gws_bin", default="gws"))
+            root()
+            return _PluginClient(home, ctx.get_config("gws_bin", default="gws"))
 
         @property
         def routes(self):
-            return watch_routes.RouteManager(ctx)
+            return watch_routes.RouteManager(ctx, store=self.store, profile=profile,
+                config=lambda: ctx.get_config("watch_routes", default={"routes": []}))
 
         @property
         def config(self):
             keys = ("watch_gmail_topic", "watch_gmail_subscription", "watch_callback_url",
-                    "watch_reconcile_seconds")
-            return {key: ctx.get_config(key, default="") for key in keys}
+                    "watch_reconcile_seconds", "watch_gmail_push_audience",
+                    "watch_gmail_push_service_account")
+            return {key: ctx.get_config(key, default=300 if key == "watch_reconcile_seconds" else "")
+                    for key in keys}
 
-        def origin(self):
-            if get_hermes_home().resolve() != install_root.parent.resolve():
-                raise W.WatchError("profile_mismatch", "Watch runtime belongs to another profile")
-            profile = get_session_env("HERMES_SESSION_PROFILE") or getattr(ctx, "profile_name", None) or "default"
-            return W.origin_from_session(
-                env=get_session_env,
-                session_key=bound_session_key(),
-                session_id=get_session_env("HERMES_SESSION_ID"),
-                profile=profile,
-            )
+        def origin(self, session_id=None):
+            root()
+            return bindings.origin(session_id, profile)
 
     runtime = Runtime()
 
-    def logout(args, **kwargs):
-        account = args.get("account")
-        if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
-            return json.dumps({"ok": False, "error_code": "invalid_arguments"})
-        account = account.lower()  # slots and watches are stored lowercase
-        if get_hermes_home().resolve() != install_root.parent.resolve():
-            return json.dumps({"ok": False, "error_code": "profile_mismatch"})
+    async def bind(raw_args="", **kwargs):
         try:
-            # Keep credentials until the worker has stopped remote subscriptions.
-            with runtime.store.tx() as conn:
-                blocked = conn.execute(
+            root()
+            return await bindings.bind(raw_args, source=kwargs.get("source"),
+                session_id=kwargs.get("session_id"), session_key=kwargs.get("session_key"),
+                platform=kwargs.get("platform"), profile=profile)
+        except Exception:
+            return "GWS binding refused: trusted context is unavailable for this profile."
+
+    ctx.register_command("gws-bind", bind, description="Bind Workspace watch delivery to this session")
+    ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(build_args, SCHEMAS))
+
+    def accounts(args, **kwargs):
+        if set(args) - {"account", "check_health", "check_lifecycle"}:
+            raise ValueError("Unknown account option")
+        for key in ("check_health", "check_lifecycle"):
+            if key in args and not isinstance(args[key], bool):
+                raise ValueError("Invalid account option")
+        account = args.get("account")
+        if account is not None and (not isinstance(account, str) or not _ACCOUNT.fullmatch(account)):
+            raise ValueError("Invalid account")
+        if args.get("check_lifecycle"):
+            if not account or args.get("check_health"):
+                raise ValueError("Lifecycle check requires one account and no health request")
+            account = account.lower()
+            # Companion holds lifecycle_guard across this read and its mutation.
+            # Do not take that lock again or hold SQLite across native processes.
+            with runtime.store.read() as conn:
+                used = conn.execute(
                     "SELECT 1 FROM watches WHERE account=? AND "
                     "(state IN ('active','matched') OR cleanup_state!='done') LIMIT 1",
                     (account,),
-                ).fetchone()
-                if blocked:
-                    return json.dumps({"ok": False, "error_code": "watches_active",
-                        "error": "Stop this account's watches and let the worker finish cleanup before logging out."})
-                result = manager.logout(root(), account, lambda: logout_account(root(), account))
-        except (OSError, ValueError):
-            result = {"ok": False, "error_code": "local_error",
-                      "error": "Local credentials could not be removed safely."}
-        return json.dumps(result)
+                ).fetchone() is not None
+            return {"ok": True, "contract": "gws-account-lifecycle-v1",
+                    "account": account, "credentials_in_use": used}
+        names = list_accounts(root())
+        if account is not None:
+            names = [name for name in names if name == account.lower()]
+        payload = {"ok": True, "accounts": names}
+        if args.get("check_health"):
+            payload["health"] = {name: account_health(root(), name,
+                gws_bin=ctx.get_config("gws_bin", default="gws")) for name in names}
+        return payload
 
-    from .workspace_tools import SCHEMAS, build_args
-    from .api_policy import make_pre_tool_call_hook
-
-    ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(build_args, SCHEMAS))
+    def api(args, **kwargs):
+        return execute_gws(root(), args.get("account"), args.get("args"),
+                           gws_bin=ctx.get_config("gws_bin", default="gws"))
 
     def workspace_handler(name):
         def handler(args, **kwargs):
-            try:
-                argv = build_args(name, args)
-                result = execute_gws(
-                    root(), args.get("account"), argv,
-                    gws_bin=ctx.get_config("gws_bin", default="gws"),
-                )
-            except ValueError as exc:
-                result = {"ok": False, "error_code": "invalid_arguments", "error": str(exc)}
-            except OSError:
-                result = {"ok": False, "error_code": "local_error",
-                          "error": "The local Workspace command could not run."}
-            return json.dumps(result)
-        return handler
+            return execute_gws(root(), args.get("account"), build_args(name, args),
+                               gws_bin=ctx.get_config("gws_bin", default="gws"))
+        return safe(handler)
 
     for name, schema in SCHEMAS.items():
-        ctx.register_tool(name=name, toolset="gws_oauth",
+        ctx.register_tool(name=name, toolset="google_workspace",
                           handler=workspace_handler(name), schema=schema)
+
+    ctx.register_tool(name="gws_accounts", toolset="google_workspace", handler=safe(accounts),
+        schema={"name": "gws_accounts", "description": "List explicitly provisioned native gws account slots in this single-operator profile. Health returns sanitized native status, not credentials. A slot name is not proof of the Google identity. check_lifecycle is a read-only companion coordination contract, not authorization to delete credentials.",
+                "parameters": {"type": "object", "additionalProperties": False, "properties": {
+                    "account": {"type": "string", "description": "Optional exact account; required for lifecycle check"},
+                    "check_health": {"type": "boolean", "default": False},
+                    "check_lifecycle": {"type": "boolean", "default": False}}, "required": []}})
+    ctx.register_tool(name="gws_api", toolset="google_workspace", handler=safe(api),
+        schema={"name": "gws_api", "description": "Advanced native Workspace API for one explicit account. Prefer curated tools and gws_schema. Native auth lifecycle/export is blocked; provision accounts with operator-side gws auth. Mutations, sends/shares and local file input/output require Hermes approval. Pass CLI tokens, not shell text. Large successful output returns output_file/output_bytes; process locally and remove after use. Failures are sanitized.",
+                "parameters": {"type": "object", "additionalProperties": False, "properties": {
+                    "account": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}}}, "required": ["account", "args"]}})
 
     def watch_handler(service):
         def handler(args, **kwargs):
-            try:
-                return json.dumps(watch_tools.handle(service, args, runtime))
-            except Exception:
-                return json.dumps({"ok": False, "error_code": "internal_error",
-                                   "error": "The watch tool failed before producing a safe result."})
-        return handler
-
-    ctx.register_tool(
-        name="gws_login", toolset="gws_oauth", handler=login,
-        schema={"name": "gws_login", "description": "Authorize one Google account for this single-operator Hermes profile on any frontend. Returns a Google consent URL; full native scopes remain the default. A browser on the Hermes host completes automatically: use action=status for the one-shot stored outcome or action=cancel to abandon the pending attempt without deleting existing credentials. From another device, paste the complete localhost callback URL in the originating session; gateway ingress intercepts it, otherwise finish using callback_url and the same account. Explicit callbacks pass through the model/history. Use reauthorize=true only to replace an existing account; old credentials remain until the new identity matches. Failures have stable reason codes; identity_mismatch reports a masked identity, so verify the exact requested spelling. Never request passwords, exported credentials, refresh tokens or standalone codes.",
-                "parameters": {"type": "object", "properties": {
-                    "account": {"type": "string", "description": "Exact Google email address to authorize"},
-                    "action": {"type": "string", "enum": ["start", "status", "cancel"], "default": "start", "description": "Start or resume login, check its status, or cancel this session's pending login"},
-                    "callback_url": {"type": "string", "description": "Complete localhost callback URL pasted by the user to finish this session’s pending login on any frontend"},
-                    "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Native gws scope preset; full requests all supported service scopes"},
-                    "scopes": {"type": "array", "items": {"type": "string"}, "description": "Exact OAuth scopes, required only with scope_mode=custom"},
-                    "reauthorize": {"type": "boolean", "default": False, "description": "Explicitly renew an existing account. Old credentials remain until identity validation and replacement succeed; cancellation, expiry or rejection preserves them, and replacement failure attempts rollback."}},
-                    "required": ["account"]}},
-    )
-    ctx.register_tool(
-        name="gws_logout", toolset="gws_oauth", handler=logout,
-        schema={"name": "gws_logout", "description": "Remove one account from this profile after Hermes approval. Cancels older pending logins and deletes only local account credentials, not Google data or Google-side consent. Stop watches and finish cleanup first. Prefer gws_login reauthorize=true for renewal without deleting working credentials.",
-                "parameters": {"type": "object", "additionalProperties": False,
-                               "properties": {"account": {"type": "string", "description": "Exact account email to remove locally"}},
-                               "required": ["account"]}},
-    )
-    ctx.register_tool(
-        name="gws_accounts", toolset="gws_oauth", handler=accounts,
-        schema={"name": "gws_accounts", "description": "List this operator’s Google accounts in the active profile without credentials. check_health=true obtains native status and a sanitized granted-scope summary; stored files are distinguished from confirmed validity. Native gws handles refresh.",
-                "parameters": {"type": "object", "properties": {
-                    "check_health": {"type": "boolean", "default": False, "description": "Optional native health check (up to 20 seconds per account). Returns state=valid|invalid|stored|unreadable, stored, valid, reauth_required and safe scope metadata, never raw output or tokens."}},
-                    "required": []}},
-    )
-    ctx.register_tool(
-        name="gws_api", toolset="gws_oauth", handler=api,
-        schema={"name": "gws_api", "description": "Advanced native Workspace API escape hatch for one explicit account. Prefer curated tools and gws_schema for common tasks. Native auth lifecycle/export is blocked; mutations, destructive operations, sends/shares and local file input/output require Hermes approval. Pass CLI tokens, not a shell command. Successful output above 200000 characters returns output_file/output_bytes: process locally and remove after use. Gmail attachment data is base64url. Native failures return sanitized error_code/category/action/reauth_required/exit_code, never raw failure output.",
-                "parameters": {"type": "object", "properties": {
-                    "account": {"type": "string", "description": "Exact email address of an authorized account"},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Exact tokens after the gws executable, for example [\"drive\",\"files\",\"list\"]"}},
-                    "required": ["account", "args"]}},
-    )
+            return watch_tools.handle(service, args, runtime, session_id=kwargs.get("session_id"))
+        return safe(handler)
 
     for service, module in (("gmail", watch_gmail), ("drive", watch_drive),
                             ("calendar", watch_calendar)):
-        ctx.register_tool(name=module.TOOL_NAME, toolset="gws_oauth",
+        ctx.register_tool(name=module.TOOL_NAME, toolset="google_workspace",
                           handler=watch_handler(service), schema=module.tool_schema())
 
-    ctx.register_hook("pre_gateway_dispatch", watch_tools.bridge_callback(runtime.store, ctx))
+    ctx.register_hook("pre_gateway_dispatch", watch_tools.bridge_callback(runtime.store, ctx, runtime.routes, profile=profile))

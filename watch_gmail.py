@@ -1,7 +1,7 @@
 """Gmail targeted watches: exact thread/message/mailbox selectors and history reader."""
 from __future__ import annotations
 
-import base64
+
 import hashlib
 import json
 import time
@@ -9,12 +9,16 @@ from email.utils import getaddresses
 
 if __package__:
     from . import watch as W
+    from .watch_pubsub import validate_config
 else:  # Direct module use by the standalone test suite.
     import watch as W
+    from watch_pubsub import validate_config
 
 TARGET_KEYS = {"thread_ids", "message_ids", "mailbox"}
 FILTER_KEYS = {"from_addresses", "from_domains", "label_ids", "subject_contains",
-               "has_attachment", "include_sent"}
+               "has_attachment", "include_sent", "change_types"}
+CHANGE_TYPES = {"messageAdded": "messagesAdded", "messageDeleted": "messagesDeleted",
+                "labelAdded": "labelsAdded", "labelRemoved": "labelsRemoved"}
 TOOL_NAME = "gws_gmail_watch"
 MAX_PAGE = 10
 PAGE_SIZE = 500
@@ -134,6 +138,8 @@ def prepare_start(client, account, args, config):
         target_resolved = {"mailbox": True, "broad": not filters}
 
     clean = {}
+    clean["change_types"] = W._clean_change_types(
+        filters.get("change_types", ["messageAdded"]), CHANGE_TYPES)
     if "from_addresses" in filters:
         clean["from_addresses"] = W.string_list(
             filters["from_addresses"], "from_addresses", cleaner=W.clean_address)
@@ -177,18 +183,9 @@ def prepare_start(client, account, args, config):
                     "scope_insufficient",
                     "has_attachment needs gmail.readonly, gmail.modify or mail.google.com and a token "
                     "without gmail.metadata; Gmail rejects format=full when the metadata scope is granted")
-    if not config.get("watch_gmail_topic"):
-        raise W.WatchError(
-            "gmail_topic_missing",
-            "Set the gws-oauth plugin setting watch_gmail_topic to a Pub/Sub topic in the OAuth client "
-            "project before starting a Gmail watch")
-    topic = str(config.get("watch_gmail_topic") or "").strip()
+    validate_config(config)
+    topic = config["watch_gmail_topic"]
     topic_parts = topic.split("/")
-    if (len(topic_parts) != 4 or topic_parts[0] != "projects" or topic_parts[2] != "topics"
-            or not topic_parts[1] or not topic_parts[3]):
-        raise W.WatchError(
-            "gmail_topic_invalid",
-            "watch_gmail_topic must be an exact Pub/Sub name: projects/<project>/topics/<topic>")
     project_reader = getattr(client, "project", None)
     if callable(project_reader):
         project_id = project_reader(account)
@@ -196,19 +193,13 @@ def prepare_start(client, account, args, config):
             raise W.WatchError(
                 "gmail_topic_project_mismatch",
                 "watch_gmail_topic must belong to the OAuth client project reported by gws auth status")
-    subscription = str(config.get("watch_gmail_subscription") or "").strip()
-    subscription_parts = subscription.split("/")
-    if (len(subscription_parts) != 4 or subscription_parts[0] != "projects"
-            or subscription_parts[2] != "subscriptions"
-            or not subscription_parts[1] or not subscription_parts[3]):
-        raise W.WatchError(
-            "gmail_subscription_missing",
-            "Set watch_gmail_subscription to the exact Pub/Sub name "
-            "projects/<project>/subscriptions/<subscription> the worker may pull")
+
 
     profile = _call(client, account, ["gmail", "users", "getProfile"], {"userId": "me"})
     if not profile.get("ok") or not isinstance(profile.get("data"), dict):
         raise W.WatchError("gmail_access", "Could not read the Gmail profile/history cursor for this account")
+    if profile["data"].get("emailAddress") != account:
+        raise W.WatchError("gmail_account_mismatch", "Gmail profile must match the exact registered account")
     history_id = profile["data"].get("historyId")
     if not isinstance(history_id, str) or not history_id.isdigit():
         raise W.WatchError("gmail_access", "Gmail did not return a numeric historyId baseline")
@@ -238,6 +229,14 @@ def _event_floor(watch):
 
 
 def event_after_start(watch, event):
+    history = event.get("history_id")
+    baseline = json.loads(watch.get("baseline_json") or "{}").get("history_id")
+    if history and baseline and str(history).isdigit() and str(baseline).isdigit():
+        if int(history) <= int(baseline):
+            return False
+    # A label/deletion change on old mail is new even though internalDate is old.
+    if event.get("change_type", "messageAdded") != "messageAdded":
+        return True
     occurred = event.get("occurred_at")
     if occurred is None:
         return True
@@ -249,10 +248,19 @@ def match(watch, event, client=None):
         return False
     target = json.loads(watch["target_json"])
     filters = json.loads(watch["filters_json"])
+    if event.get("change_type", "messageAdded") not in filters.get("change_types", ["messageAdded"]):
+        return False
     if not target.get("mailbox"):
         if event.get("thread_id") not in (target.get("thread_ids") or []):
             return False
     labels = event.get("label_ids") or []
+    # Deletion tombstones have no sender/subject/attachment metadata. Explicit
+    # metadata predicates fail closed; absent labels also cannot prove not-SENT.
+    if event.get("metadata_missing"):
+        if any(key in filters for key in ("from_addresses", "from_domains", "subject_contains", "has_attachment")):
+            return False
+        if not filters.get("include_sent") and not event.get("labels_known"):
+            return False
     if not filters.get("include_sent") and any(label in labels for label in ("SENT", "DRAFT")):
         return False
     if filters.get("label_ids") and not any(label in labels for label in filters["label_ids"]):
@@ -277,11 +285,15 @@ def match(watch, event, client=None):
 
 def render(watch, event):
     payload = {
+        "change_type": event.get("change_type", "messageAdded"),
+        "history_id": event.get("history_id"),
+        "metadata_missing": bool(event.get("metadata_missing")),
+        "changed_label_ids": event.get("changed_label_ids", []),
         "message_id": event.get("message_id"),
         "thread_id": event.get("thread_id"),
         "from": event.get("from_address") or "",
         "subject": (event.get("subject") or "")[:500],
-        "received_at": W.now_iso(event.get("occurred_at")),
+        "received_at": W.now_iso(event["occurred_at"]) if event.get("occurred_at") is not None else None,
         "labels": [str(label)[:128] for label in (event.get("label_ids") or [])[:20]],
     }
     if "has_attachment" in event:
@@ -311,10 +323,10 @@ def drain(client, store, source, watches, *, max_pages=MAX_PAGE):
     if not cursor:
         return {"ok": False, "error_code": "cursor_missing"}
     page_token = source.get("cursor_staged")
-    last_history = None
     for _ in range(max_pages):
-        params = {"userId": "me", "startHistoryId": cursor, "maxResults": PAGE_SIZE,
-                  "historyTypes": ["messageAdded"]}
+        # Always read all types. A shared source's filter cannot change between
+        # pages when another consumer starts; per-watch filtering happens below.
+        params = {"userId": "me", "startHistoryId": cursor, "maxResults": PAGE_SIZE}
         if page_token:
             params["pageToken"] = page_token
         result = _call(client, source["account"], ["gmail", "users", "history", "list"], params)
@@ -333,25 +345,40 @@ def drain(client, store, source, watches, *, max_pages=MAX_PAGE):
             return {"ok": False, "error_code": result.get("error_code", "gmail_error"),
                     "http_status": result.get("http_status"), "retryable": result.get("retryable", True)}
         data = result.get("data") or {}
-        message_ids = []
+        changes = []
         for record in data.get("history", []) or []:
-            for message in record.get("messagesAdded", []) or []:
-                detail = message.get("message") or {}
-                message_id = detail.get("id")
-                if isinstance(message_id, str) and message_id and message_id not in message_ids:
-                    message_ids.append(message_id)
+            history = str(record.get("id") or "")
+            if not history.isdigit():
+                return {"ok": False, "error_code": "gmail_history_invalid", "retryable": True}
+            for change_type, field in CHANGE_TYPES.items():
+                for change in record.get(field, []) or []:
+                    changes.append((history, change_type, change))
         watch_events = []
-        for message_id in message_ids:
+        for history, change_type, change in changes:
+            detail = change.get("message") or {}
+            message_id = detail.get("id")
+            if not isinstance(message_id, str) or not message_id:
+                return {"ok": False, "error_code": "gmail_history_invalid", "retryable": True}
             try:
-                event = _message_event(client, source["account"], message_id)
+                if change_type == "messageDeleted":
+                    event = {"message_id": message_id, "thread_id": detail.get("threadId"),
+                             "label_ids": detail.get("labelIds", []), "metadata_missing": True,
+                             "labels_known": "labelIds" in detail}
+                else:
+                    event = _message_event(client, source["account"], message_id)
             except W.WatchError as exc:
                 if exc.code == "target_not_found":
-                    continue  # deleted between the history record and the fetch
-                # Transient metadata failure: do not advance the committed cursor
-                # past a message that was never classified; replay from the same
-                # cursor is safe because outbox event IDs are deterministic.
-                store.update_source(source["source_id"], last_error=exc.message)
-                return {"ok": False, "error_code": exc.code, "retryable": True}
+                    if change_type == "messageAdded":
+                        continue  # legacy arrival behavior for vanished mail
+                    event = {"message_id": message_id, "thread_id": detail.get("threadId"),
+                             "label_ids": detail.get("labelIds", []), "metadata_missing": True,
+                             "labels_known": "labelIds" in detail}
+                else:
+                    # Transient metadata failures must replay the entire page.
+                    store.update_source(source["source_id"], last_error=exc.message)
+                    return {"ok": False, "error_code": exc.code, "retryable": True}
+            event.update(history_id=history, change_type=change_type,
+                         changed_label_ids=change.get("labelIds", []))
             for watch in watches:
                 if watch["service"] != "gmail":
                     continue
@@ -365,92 +392,27 @@ def drain(client, store, source, watches, *, max_pages=MAX_PAGE):
                     return {"ok": False, "error_code": exc.code, "retryable": True}
                 if matched:
                     payload = render(watch, event)
-                    event_id = "gmail:" + watch["watch_id"] + ":" + hashlib.sha256(
-                        (source["account"] + ":" + message_id).encode()).hexdigest()[:24]
+                    # Keep legacy arrival IDs stable; label cycles/deletions
+                    # require record/type identity, not the message's latest ID.
+                    key = source["account"] + ":" + message_id
+                    if change_type != "messageAdded":
+                        key += ":" + history + ":" + change_type + ":" + json.dumps(sorted(event["changed_label_ids"]))
+                    event_id = "gmail:" + watch["watch_id"] + ":" + hashlib.sha256(key.encode()).hexdigest()[:24]
                     watch_events.append((watch["watch_id"], event_id, "gmail", payload))
         history_id = str(data.get("historyId") or "")
+        if not history_id.isdigit() or int(history_id) < int(cursor):
+            return {"ok": False, "error_code": "gmail_history_invalid", "retryable": True}
         next_token = data.get("nextPageToken")
         if next_token:
             store.apply_events(source["source_id"], watch_events, cursor_staged=str(next_token))
             page_token = str(next_token)
-            last_history = history_id or last_history
             continue
-        final = history_id or last_history or cursor
+        final = history_id
         store.apply_events(source["source_id"], watch_events, cursor=final, clear_staged=True)
-        store.settle_hints(source["source_id"])
+
         return {"ok": True, "events": len(watch_events), "cursor": final}
     return {"ok": True, "staged": True, "pages": max_pages}
 
-
-def pubsub_pull(client, store, source, config, *, max_messages=20):
-    """Pull one Pub/Sub batch and durably route validated high-water hints.
-
-    One subscription can receive pushes for several Gmail accounts in the same
-    profile (all watches may share the profile's topic). Route each message by
-    ``emailAddress`` to every local source for that account and acknowledge only
-    messages this profile made durable; never acknowledge another account's
-    notification just because a different account's worker loop pulled it.
-    """
-    topic = config.get("watch_gmail_topic")
-    subscription = config.get("watch_gmail_subscription")
-    if not topic or not subscription:
-        return {"ok": False, "error_code": "gmail_topic_missing", "retryable": False}
-    # Internal dispatch marker: GwsClient routes these two operations through
-    # account-bound REST, not the unsupported native gws Pub/Sub CLI.
-    result = _call(client, source["account"], ["pubsub:v1", "projects", "subscriptions", "pull"],
-                   {"subscription": subscription},
-                   body={"maxMessages": max_messages, "returnImmediately": True})
-    if not result.get("ok"):
-        return {"ok": False, "error_code": result.get("error_code", "pubsub_error"),
-                "retryable": result.get("retryable", True)}
-    data = result.get("data") or {}
-    ack_ids = []
-    hints = unrouted = 0
-    for received in data.get("receivedMessages", []) or []:
-        ack_id = received.get("ackId")
-        message = received.get("message") or {}
-        raw = message.get("data")
-        try:
-            payload = json.loads(base64.b64decode(raw or "", altchars=b"-_", validate=True).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError, TypeError):
-            if isinstance(ack_id, str) and ack_id:
-                ack_ids.append(ack_id)  # malformed forever: acknowledging avoids a poison loop
-            continue
-        if not isinstance(payload, dict):
-            if isinstance(ack_id, str) and ack_id:
-                ack_ids.append(ack_id)
-            continue
-        address = str(payload.get("emailAddress") or "").strip().lower()
-        history_id = payload.get("historyId")
-        # Gmail push uses a JSON integer; REST history responses use strings.
-        if type(history_id) is int and history_id >= 0:
-            history_id = str(history_id)
-        if not address or not isinstance(history_id, str) or not history_id.isdigit():
-            if isinstance(ack_id, str) and ack_id:
-                ack_ids.append(ack_id)
-            continue
-        if address and address != source["account"]:
-            targets = store.list_sources(service="gmail", account=address)
-        else:
-            targets = store.list_sources(service="gmail", account=source["account"]) or [source]
-        if not targets:
-            # Belongs to an account this profile does not watch: leave it
-            # unacknowledged rather than destroying another consumer's hint.
-            unrouted += 1
-            continue
-        for target in targets:
-            hint_id = "gmail:" + target["source_id"] + ":" + history_id
-            store.add_hint(hint_id, target["source_id"], {"history_id": history_id})
-            hints += 1
-        if isinstance(ack_id, str) and ack_id:
-            ack_ids.append(ack_id)
-    if ack_ids:
-        ack = _call(client, source["account"], ["pubsub:v1", "projects", "subscriptions", "acknowledge"],
-                    {"subscription": subscription}, body={"ackIds": ack_ids})
-        if not ack.get("ok"):
-            # The hint is already durable; redelivery is harmless and will be re-drained.
-            return {"ok": True, "hints": hints, "unrouted": unrouted, "ack": "retryable"}
-    return {"ok": True, "hints": hints, "unrouted": unrouted, "ack": "ok"}
 
 
 def tool_schema():
@@ -486,6 +448,10 @@ def tool_schema():
                         "subject_contains": {"type": "array", "items": {"type": "string"}},
                         "has_attachment": {"type": "boolean"},
                         "include_sent": {"type": "boolean", "default": False},
+                        "change_types": {"type": "array", "minItems": 1,
+                                         "items": {"type": "string", "enum": list(CHANGE_TYPES)},
+                                         "default": ["messageAdded"],
+                                         "description": "Deletion tombstones lack sender/subject/attachment metadata; those predicates cannot match. Without labels, include_sent=true is required."},
                     },
                     "additionalProperties": False,
                 },

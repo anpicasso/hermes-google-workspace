@@ -35,10 +35,10 @@ if __package__:
     from . import watch as W
     from . import watch_calendar, watch_drive, watch_gmail, watch_routes
     from .router import bounded_gws
-    from .watch_pubsub import PubSubClient
+    from . import watch_pubsub
 else:  # Direct module use by the standalone test suite.
     from router import bounded_gws  # type: ignore
-    from watch_pubsub import PubSubClient
+    import watch_pubsub
     import watch as W  # type: ignore
     import watch_calendar, watch_drive, watch_gmail, watch_routes  # type: ignore
 
@@ -51,20 +51,16 @@ LEASE_SECONDS = {"gmail": 6 * 86400, "drive": 6 * 86400, "calendar": 6 * 86400}
 
 
 class GwsClient:
-    """Bounded native Workspace calls plus narrow account-bound Pub/Sub REST."""
+    """Bounded native Workspace calls; native gws exclusively owns OAuth."""
 
     def __init__(self, home, *, gws_bin="gws", timeout=30):
         self.root = Path(home).expanduser().resolve() / "gws-oauth"
         self.gws_bin = gws_bin
         self.timeout = timeout
-        self.pubsub = PubSubClient(self.root, gws_bin)
+
 
     def call(self, account, args, params=None, body=None, timeout=None):
-        if list(args[:3]) == ["pubsub:v1", "projects", "subscriptions"]:
-            if len(args) != 4 or set(params or {}) != {"subscription"}:
-                return {"ok": False, "error_code": "invalid_arguments", "retryable": False}
-            return self.pubsub.call(account, args[3], params["subscription"], body,
-                                    timeout=timeout or self.timeout)
+
         argv = list(args)
         if params is not None:
             argv += ["--params", json.dumps(params, separators=(",", ":"), sort_keys=True)]
@@ -163,9 +159,12 @@ class CallbackServer:
         self.runner = None
 
     async def start(self):
+        if self.host not in ("127.0.0.1", "::1"):
+            raise ValueError("CallbackServer must bind a loopback address")
         if web is None:
             raise RuntimeError("aiohttp is unavailable; Google callbacks cannot be received")
-        app = web.Application(client_max_size=MAX_BODY)
+        app = web.Application(client_max_size=watch_pubsub.MAX_BODY)
+        app.router.add_post("/google/gmail", self._gmail)
         app.router.add_post("/google/drive", self._handle)
         app.router.add_post("/google/calendar", self._handle)
         self.runner = web.AppRunner(app, access_log=None)
@@ -183,6 +182,13 @@ class CallbackServer:
         status, payload = await asyncio.to_thread(
             process_callback, self.worker.store, request.headers, raw)
         return web.json_response(payload, status=status)
+
+    async def _gmail(self, request):
+        assert web is not None
+        raw = await request.read()
+        status, payload = await asyncio.to_thread(
+            watch_pubsub.process_push, self.worker.store, self.worker.config, request.headers, raw)
+        return web.Response(status=204) if status == 204 else web.json_response(payload, status=status)
 
 
 class Worker:
@@ -219,9 +225,12 @@ class Worker:
         return base + "/google/" + service
 
     def _ensure_gmail(self, source):
-        topic = self.config.get("watch_gmail_topic")
-        if not topic:
+        try:
+            watch_pubsub.validate_config(self.config)
+        except W.WatchError as exc:
+            self.store.update_source(source["source_id"], last_error=exc.message)
             return False
+        topic = self.config["watch_gmail_topic"]
         remote = self.store.remote_for_source(source["source_id"], "gmail_watch")
         now = self.clock()
         if remote and (remote.get("expires_at") or 0) > now + 86400:
@@ -329,12 +338,17 @@ class Worker:
         if not watches:
             return {"ok": True, "skipped": "no consumers"}
         service = source["service"]
-        transport_error = None
+        # Settle only hints visible before this read, never a racing PUSH.
+        hints = self.store.pending_hints(source["source_id"])
+        transport_error = (source.get("last_error") if _backoff_state(
+            self.store, "backoff:sub:" + source["source_id"]).get("attempts") else None)
+        if service == "gmail":
+            try:
+                watch_pubsub.validate_config(self.config)
+            except W.WatchError as exc:
+                transport_error = exc.message
         try:
             if service == "gmail":
-                pulled = watch_gmail.pubsub_pull(self.client, self.store, source, self.config)
-                if not pulled.get("ok"):
-                    transport_error = pulled.get("error_code", "pubsub error")
                 result = watch_gmail.drain(self.client, self.store, source, watches)
             elif service == "drive":
                 result = watch_drive.drain(self.client, self.store, source, watches)
@@ -355,7 +369,13 @@ class Worker:
                         watch["watch_id"],
                         gap="Drive change token was rejected; source requires an explicit resync/restart")
             return result
-        self.store.settle_hints(source["source_id"])
+        if not result.get("staged"):
+            if service == "gmail" and result.get("cursor"):
+                hints = [hint for hint in hints if int(json.loads(hint["payload_json"])["history_id"])
+                         <= int(result["cursor"])]
+            with self.store.tx() as conn:
+                conn.executemany("UPDATE hints SET state='done' WHERE hint_id=?",
+                                 [(hint["hint_id"],) for hint in hints])
         self.store.update_source(source["source_id"], last_error=transport_error)
         return result
 
@@ -564,10 +584,13 @@ class Worker:
                 continue
             # A failed push lease must not disable cursor reconciliation.
             self.ensure_subscription(source)
+            source = self.store.get_source(source["source_id"])
+            if source is None:
+                continue
             pending = self.store.pending_hints(source["source_id"])
             reconcile_due = ((source.get("last_reconcile") or 0) + self.reconcile_seconds
                              <= self.clock())
-            if source["service"] == "gmail" or pending or reconcile_due:
+            if source.get("cursor_staged") or pending or reconcile_due:
                 self.drain_source(source)
         self.cleanup()
         self.forward()
@@ -668,22 +691,45 @@ def health(store, lock_path, *, stale_seconds=60):
             "sources": sources}
 
 
+def profile_settings(home):
+    """Read only this profile's documented plugin settings; no ambient fallback."""
+    import yaml
+    try:
+        path = Path(home).expanduser().absolute() / "config.yaml"
+        if not path.exists():
+            return {}
+        with path.open(encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+        if config is None:
+            return {}
+        entry = config.get("plugins", {}).get("entries", {}).get("google-workspace", {})
+        legacy, settings = entry.get("config", {}), entry.get("settings", {})
+        if not isinstance(legacy, dict) or not isinstance(settings, dict):
+            raise ValueError
+        return {**legacy, **settings}
+    except (OSError, ValueError, AttributeError, yaml.YAMLError):
+        raise ValueError("Invalid google-workspace profile configuration") from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="watch_worker", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="run the single profile worker in the foreground")
     run.add_argument("--home", required=True, help="Exact Hermes profile home")
-    run.add_argument("--gws-bin", default="gws")
-    run.add_argument("--callback-url", default="")
-    run.add_argument("--gmail-topic", default="")
-    run.add_argument("--gmail-subscription", default="")
+    run.add_argument("--gws-bin")
+    run.add_argument("--callback-url")
+    run.add_argument("--gmail-topic")
+    run.add_argument("--gmail-subscription")
+    run.add_argument("--gmail-push-audience")
+    run.add_argument("--gmail-push-service-account")
     run.add_argument("--callback-host", default="127.0.0.1")
     run.add_argument("--callback-port", type=int, default=8765)
     run.add_argument("--interval", type=int, default=5)
-    run.add_argument("--reconcile-seconds", type=int, default=300)
-    run.add_argument("--subscription-backoff-max", type=int, default=900,
+    run.add_argument("--reconcile-seconds", type=int)
+    run.add_argument("--profile", default="default", help="Exact gateway profile name")
+    run.add_argument("--subscription-backoff-max", type=int,
                      help="cap in seconds for failed subscription create/renew retries")
-    run.add_argument("--retention-days", type=int, default=7,
+    run.add_argument("--retention-days", type=int,
                      help="days to keep fully cleaned terminal watch records")
     listing = sub.add_parser("list", help="list this profile's watches")
     listing.add_argument("--home", required=True)
@@ -709,15 +755,21 @@ def main(argv=None):
         row = W.operator_stop(store, args.watch_id)
         _print({"ok": True, "watch": W.watch_status(store, row), "remote_cleanup": "pending"})
         return 0
-    config = {"watch_callback_url": args.callback_url,
-              "watch_gmail_topic": args.gmail_topic,
-              "watch_gmail_subscription": args.gmail_subscription,
-              "watch_reconcile_seconds": args.reconcile_seconds,
-              "watch_subscription_backoff_max": args.subscription_backoff_max,
-              "watch_retention_days": args.retention_days}
+    config = profile_settings(args.home)
+    overrides = {"watch_callback_url": args.callback_url,
+                 "watch_gmail_topic": args.gmail_topic,
+                 "watch_gmail_subscription": args.gmail_subscription,
+                 "watch_gmail_push_audience": args.gmail_push_audience,
+                 "watch_gmail_push_service_account": args.gmail_push_service_account,
+                 "watch_reconcile_seconds": args.reconcile_seconds,
+                 "watch_subscription_backoff_max": args.subscription_backoff_max,
+                 "watch_retention_days": args.retention_days}
+    config.update({key: value for key, value in overrides.items() if value is not None})
     os.environ["HERMES_HOME"] = str(Path(args.home).expanduser().resolve())
-    client = GwsClient(args.home, gws_bin=args.gws_bin)
-    routes = watch_routes.RouteManager(home=args.home)
+    client = GwsClient(args.home, gws_bin=args.gws_bin or config.get("gws_bin", "gws"))
+    # Re-read route attestations for every delivery; edits revoke existing bindings.
+    routes = watch_routes.RouteManager(home=args.home, profile=args.profile,
+        config=lambda: profile_settings(args.home).get("watch_routes", {"routes": []}))
     worker = Worker(args.home, client, routes, config)
     with SingleInstance(_lock_path(args.home)):
         try:

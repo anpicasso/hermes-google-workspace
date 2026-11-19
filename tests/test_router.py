@@ -1,12 +1,13 @@
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from router import account_health, classify_gws_failure, execute_gws, list_accounts
+from router import account_dir, account_health, account_identity, bounded_gws, classify_gws_failure, execute_gws, files_dir, list_accounts
 
 
 def _account(root, name="person@example.com", content="fixture-value"):
@@ -24,6 +25,291 @@ def _fake_gws(tmp, body):
 
 
 class RouterTests(unittest.TestCase):
+    def test_native_dotenv_ancestor_injection_is_stopped_by_empty_sentinel(self):
+        import subprocess
+        from router import _account_env
+        binary = shutil.which("gws")
+        if not binary:
+            self.skipTest("native gws is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            slot = _account(root, content="not-encrypted-synthetic")
+            # All files are synthetic; auth status cannot refresh these credentials.
+            (root / ".env").write_text("GOOGLE_WORKSPACE_CLI_TOKEN=synthetic-dotenv-only\n")
+            unguarded = root / "unguarded"
+            unguarded.mkdir()
+            result = subprocess.run([binary, "auth", "status"], env=_account_env(slot),
+                                    cwd=unguarded, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(json.loads(result.stdout)["credential_source"], "token_env_var")
+            result = bounded_gws(root, slot.name, ["auth", "status"], gws_bin=binary)
+            self.assertTrue(result["ok"])
+            self.assertNotEqual(result["data"]["credential_source"], "token_env_var")
+            self.assertFalse(result["data"]["encryption_valid"])
+            sentinel = root / "files/.env"
+            self.assertEqual(sentinel.stat().st_size, 0)
+            self.assertFalse(account_health(root, slot.name, gws_bin=binary)["valid"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX sentinel safety")
+    def test_unsafe_dotenv_sentinels_never_spawn_or_truncate(self):
+        for kind in ("content", "symlink", "hardlink", "directory", "fifo"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                slot = _account(tmp)
+                directory = Path(tmp) / "files"
+                directory.mkdir()
+                sentinel = directory / ".env"
+                foreign = Path(tmp) / "foreign"
+                foreign.write_text("synthetic-do-not-truncate")
+                if kind == "content":
+                    sentinel.write_text("GOOGLE_WORKSPACE_CLI_TOKEN=synthetic\n")
+                elif kind == "symlink":
+                    sentinel.symlink_to(foreign)
+                elif kind == "hardlink":
+                    os.link(foreign, sentinel)
+                elif kind == "directory":
+                    sentinel.mkdir()
+                else:
+                    os.mkfifo(sentinel)
+                with mock.patch("router.subprocess.run") as run:
+                    for call in (execute_gws, bounded_gws):
+                        self.assertFalse(call(tmp, slot.name, ["drive", "files", "list"])["ok"])
+                    self.assertIsNone(account_health(tmp, slot.name)["valid"])
+                    run.assert_not_called()
+                self.assertEqual(foreign.read_text(), "synthetic-do-not-truncate")
+
+    def test_relative_binary_and_files_keep_documented_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            slot = _account(tmp)
+            directory = files_dir(tmp)
+            (directory / "input.txt").write_text("relative input")
+            absolute = Path(tmp) / "absolute.txt"
+            absolute.write_text("absolute input")
+            fake = _fake_gws(tmp, """import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args == ['auth', 'status']:
+    print(json.dumps({'token_valid': Path('.env').stat().st_size == 0}))
+else:
+    source = Path(args[args.index('--upload') + 1])
+    target = Path(args[args.index('--output') + 1])
+    target.write_text(source.read_text())
+    print(json.dumps({'cwd': str(Path.cwd()), 'binary': sys.argv[0]}))
+""")
+            binary = os.path.relpath(fake)
+            for call in (execute_gws, bounded_gws):
+                for source, output in (("input.txt", "output.txt"),
+                                       (str(absolute), str(Path(tmp) / "absolute-out.txt"))):
+                    result = call(tmp, slot.name, ["drive", "+upload", "--upload", source,
+                                                   "--output", output], gws_bin=binary)
+                    self.assertTrue(result["ok"], result)
+                    self.assertEqual(result["data"]["cwd"], str(directory))
+                    self.assertTrue(Path(result["data"]["binary"]).is_absolute())
+                    self.assertEqual((directory / output).read_text(),
+                                     (directory / source).read_text())
+            self.assertTrue(account_health(tmp, slot.name, gws_bin=binary)["valid"])
+
+    def test_explicit_identity_native_user_gmail_fallback_and_no_scope_limit(self):
+        cases = [
+            ({"token_valid": True, "user": "PERSON@example.com"}, {}, True, None, 1),
+            ({"token_valid": True, "user": "foreign@example.com"}, {}, False, "identity_mismatch", 1),
+            ({"token_valid": True, "scopes": ["https://www.googleapis.com/auth/drive"]}, {},
+             False, "identity_unconfirmed", 1),
+            ({"token_valid": True, "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]},
+             {"emailAddress": "person@example.com"}, True, None, 2),
+            ({"token_valid": True, "scopes": ["https://www.googleapis.com/auth/gmail.metadata"]},
+             {"emailAddress": "foreign@example.com"}, False, "identity_mismatch", 2),
+            ({"token_valid": True, "scopes": ["https://www.googleapis.com/auth/gmail.send"]}, {},
+             False, "identity_unconfirmed", 1),
+            ({"token_valid": True, "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]},
+             {}, False, "identity_unconfirmed", 2),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            slot = _account(tmp)
+            for status, profile, ok, code, count in cases:
+                with self.subTest(status=status, profile=profile):
+                    replies = [mock.Mock(returncode=0, stdout=json.dumps(data), stderr="")
+                               for data in (status, profile)]
+                    with mock.patch("router.subprocess.run", side_effect=replies) as run:
+                        result = account_identity(tmp, slot.name)
+                    self.assertEqual(result["ok"], ok)
+                    self.assertEqual(result.get("error_code"), code)
+                    self.assertEqual(run.call_count, count)
+                    self.assertNotIn("foreign", json.dumps(result))
+                    if count == 2:
+                        self.assertEqual(run.call_args.args[0][1:4], ["gmail", "users", "getProfile"])
+                        self.assertLessEqual(run.call_args.kwargs["timeout"], 20)
+            with mock.patch("router.subprocess.run", return_value=mock.Mock(returncode=0,
+                    stdout='{"token_valid":true,"user":"foreign@example.com"}', stderr="")):
+                self.assertEqual(account_health(tmp, slot.name)["error_code"], "identity_mismatch")
+
+    def test_minimal_environment_is_shared_by_all_native_entrypoints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            slot = _account(root)
+            foreign = Path(tmp) / "foreign"
+            adc = foreign / ".config/gcloud/application_default_credentials.json"
+            adc.parent.mkdir(parents=True)
+            adc.write_text('{"type":"authorized_user","refresh_token":"synthetic-only"}')
+            injected = {name: "synthetic-only" for name in (
+                "GOOGLE_WORKSPACE_CLI_TOKEN", "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET",
+                "GOOGLE_WORKSPACE_CLI_LOG", "GOOGLE_WORKSPACE_PROJECT_ID", "OPENAI_API_KEY",
+                "RUST_LOG", "PYTHONPATH", "HTTPS_PROXY", "CLOUDSDK_CONFIG", "XDG_CONFIG_HOME")}
+            injected.update(HOME=str(foreign), GOOGLE_APPLICATION_CREDENTIALS=str(adc),
+                            GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=str(adc))
+            fake = _fake_gws(tmp, """import json, os
+from pathlib import Path
+allowed = {'PATH', 'HOME', 'GOOGLE_WORKSPACE_CLI_CONFIG_DIR', 'GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND'}
+if os.name == 'nt':
+    allowed.update({'SYSTEMROOT', 'USERPROFILE'})
+home = Path(os.environ['HOME'])
+isolated = (set(os.environ) <= allowed | {'LC_CTYPE'} and
+            not (home / '.config/gcloud/application_default_credentials.json').exists())
+print(json.dumps({'token_valid': isolated, 'isolated': isolated, 'home': str(home),
+                  'config': os.environ['GOOGLE_WORKSPACE_CLI_CONFIG_DIR'],
+                  'backend': os.environ['GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND']}))
+""")
+            with mock.patch.dict(os.environ, injected):
+                for call in (execute_gws, bounded_gws):
+                    result = call(root, slot.name, ["drive", "files", "list"], gws_bin=str(fake))
+                    self.assertTrue(result["ok"])
+                    self.assertTrue(result["data"]["isolated"])
+                    self.assertEqual(result["data"]["config"], str(slot.resolve()))
+                    self.assertEqual(result["data"]["backend"], "file")
+                    home = Path(result["data"]["home"])
+                    self.assertTrue(home.is_relative_to(slot))
+                    self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+                self.assertTrue(account_health(root, slot.name, gws_bin=str(fake))["valid"])
+                self.assertEqual(os.environ["HOME"], str(foreign))
+
+    def test_concurrent_accounts_have_distinct_homes_and_absolute_stores(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            names = ("one@example.com", "two@example.com")
+            for name in names:
+                _account(root, name)
+            fake = _fake_gws(tmp, "import json, os\nprint(json.dumps({k: os.environ[k] for k in "
+                             "('HOME', 'GOOGLE_WORKSPACE_CLI_CONFIG_DIR')}))\n")
+            relative_root = os.path.relpath(root)
+            with ThreadPoolExecutor(2) as pool:
+                results = list(pool.map(lambda name: execute_gws(
+                    relative_root, name, ["drive", "files", "list"], gws_bin=str(fake)), names))
+            homes = set()
+            for name, result in zip(names, results):
+                self.assertTrue(result["ok"])
+                config = Path(result["data"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"])
+                self.assertEqual(config, root / "accounts" / name)
+                home = Path(result["data"]["HOME"])
+                self.assertTrue(home.is_relative_to(config))
+                homes.add(home)
+            self.assertEqual(len(homes), 2)
+
+    def test_missing_slots_and_malformed_aliases_never_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "accounts/empty@example.com").mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"GOOGLE_WORKSPACE_CLI_TOKEN": "synthetic-only",
+                    "GOOGLE_APPLICATION_CREDENTIALS": str(root / "foreign-adc.json")}), \
+                    mock.patch("router.subprocess.run") as run:
+                for name in ("missing@example.com", "empty@example.com", "../escape", ".", "..",
+                             "/absolute", "bad/name", "bad\\name", "", None, "a" * 129):
+                    with self.subTest(account=name):
+                        with self.assertRaises(ValueError):
+                            execute_gws(root, name, ["drive", "files", "list"])
+                        self.assertFalse(bounded_gws(root, name, ["auth", "status"])["ok"])
+                run.assert_not_called()
+
+    @unittest.skipIf(os.name != "posix", "POSIX symlink regression")
+    def test_symlinked_store_paths_and_native_files_are_rejected(self):
+        for part in ("root", "ancestor", "accounts", "slot", "credentials.enc", "credentials.json",
+                     ".encryption_key", "client_secret.json", "token_cache.json", "sa_token_cache.json"):
+            with self.subTest(part=part), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "profile"
+                slot = _account(root)
+                target = {"root": root, "ancestor": root, "accounts": slot.parent,
+                          "slot": slot}.get(part, slot / part)
+                moved = Path(tmp) / "foreign"
+                if target.exists():
+                    target.rename(moved)
+                target.symlink_to(moved)  # Also test dangling native-file symlinks.
+                if part == "ancestor":
+                    root = root / "nested"
+                    _account(moved / "nested")
+                with self.assertRaises(ValueError):
+                    account_dir(root, slot.name)
+                self.assertEqual(list_accounts(root), [])
+                with mock.patch("router.subprocess.run") as run:
+                    self.assertFalse(bounded_gws(root, slot.name, ["auth", "status"])["ok"])
+                    run.assert_not_called()
+
+    @unittest.skipIf(os.name != "posix", "POSIX native-file metadata regression")
+    def test_nonregular_and_hardlinked_native_files_fail_closed(self):
+        for kind in ("directory", "fifo", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                slot = _account(tmp)
+                target = slot / "token_cache.json"
+                if kind == "directory":
+                    target.mkdir()
+                elif kind == "fifo":
+                    os.mkfifo(target)
+                else:
+                    os.link(slot / "credentials.enc", target)
+                with self.assertRaises(ValueError):
+                    account_dir(tmp, slot.name)
+                with mock.patch("router.subprocess.run") as run:
+                    self.assertFalse(bounded_gws(tmp, slot.name, ["auth", "status"])["ok"])
+                    run.assert_not_called()
+
+    @unittest.skipIf(os.name != "posix", "POSIX symlink regression")
+    def test_isolated_home_and_lock_symlinks_fail_closed(self):
+        import hashlib
+        from router import _account_env
+        for part in ("home", "adc", "swap_lock", "account_lock", "lock_dir"):
+            with self.subTest(part=part), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "profile"
+                slot = _account(root)
+                home = Path(_account_env(slot)["HOME"])
+                self.assertTrue(home.is_relative_to(slot))  # Never mutate a real HOME on failure.
+                foreign = Path(tmp) / "foreign"
+                foreign.mkdir()
+                if part == "home":
+                    home.rmdir()
+                    home.symlink_to(foreign)
+                elif part == "adc":
+                    (home / ".config").symlink_to(foreign)
+                else:
+                    name = hashlib.sha256(slot.name.encode()).hexdigest()[:32]
+                    target = {"swap_lock": slot.parent / ".lock", "lock_dir": root / ".locks",
+                              "account_lock": root / ".locks" / f"{name}.lock"}[part]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(foreign if part == "lock_dir" else foreign / "missing")
+                with mock.patch("router.subprocess.run") as run:
+                    self.assertFalse(bounded_gws(root, slot.name, ["auth", "status"])["ok"])
+                    run.assert_not_called()
+                self.assertEqual(list(foreign.iterdir()), [])
+
+    def test_native_corrupt_store_status_is_sanitized(self):
+        binary = shutil.which("gws")
+        if not binary:
+            self.skipTest("native gws is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "profile"
+            slot = _account(root, content="not-an-encrypted-credential")
+            # No valid refresh material: native status cannot make an OAuth request.
+            foreign = Path(tmp) / "foreign"
+            adc = foreign / ".config/gcloud/application_default_credentials.json"
+            adc.parent.mkdir(parents=True)
+            adc.write_text("not-json-synthetic-adc")
+            with mock.patch.dict(os.environ, {"HOME": str(foreign),
+                    "GOOGLE_APPLICATION_CREDENTIALS": str(adc),
+                    "GOOGLE_WORKSPACE_CLI_TOKEN": "synthetic-only"}):
+                health = account_health(root, slot.name, gws_bin=binary)
+            self.assertEqual(health["state"], "unreadable")
+            self.assertFalse(health["valid"])
+            self.assertTrue(health["reauth_required"])
+            self.assertNotIn("synthetic", json.dumps(health))
+            self.assertNotIn(str(tmp), json.dumps(health))
+
     def test_large_success_is_saved_complete_and_private(self):
         with tempfile.TemporaryDirectory() as tmp:
             _account(tmp)
@@ -50,6 +336,7 @@ class RouterTests(unittest.TestCase):
             files = Path(tmp).resolve() / "files"
             self.assertEqual(run.call_args.kwargs["cwd"], files)
             self.assertEqual(files.stat().st_mode & 0o777, 0o700)
+            (files / ".env").unlink()
             files.rmdir()
             files.symlink_to(tmp)
             with mock.patch("router.subprocess.run") as run:
@@ -191,7 +478,8 @@ assert acquired.is_set()
         self.assertEqual(result["error_code"], "invalid_grant")
         self.assertTrue(result["reauth_required"])
         self.assertEqual(result["action"], "reauthorize")
-        self.assertIn("reauthorize=true", result["error"])
+        self.assertIn("gws auth login", result["error"])
+        self.assertNotIn("gws_login", result["error"])
         rendered = json.dumps(result)
         self.assertNotIn("secret", rendered)
         self.assertNotIn("refresh_token", rendered)
@@ -200,16 +488,10 @@ assert acquired.is_set()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "profile"
             _account(root)
-            fake = _fake_gws(tmp, (
-                "import json, os, sys\n"
-                "if sys.argv[1:3] != ['auth', 'status']:\n"
-                "    sys.exit(3)\n"
-                "print(os.environ['FAKE_STATUS_JSON'])\n"
-            ))
             valid = {"auth_method": "oauth2", "token_valid": True, "email": "person@example.com",
                      "access_token": "ya29.secret", "refresh_token": "secret-refresh"}
-            with mock.patch.dict(os.environ, {"FAKE_STATUS_JSON": json.dumps(valid)}):
-                health = account_health(root, "person@example.com", gws_bin=str(fake))
+            fake = _fake_gws(tmp, "print(" + repr(json.dumps(valid)) + ")\n")
+            health = account_health(root, "person@example.com", gws_bin=str(fake))
             self.assertEqual(health["state"], "valid")
             self.assertTrue(health["stored"])
             self.assertTrue(health["valid"])
@@ -218,31 +500,33 @@ assert acquired.is_set()
 
             invalid = {"auth_method": "oauth2", "token_valid": False,
                        "access_token": "ya29.secret", "refresh_token": "secret-refresh"}
-            with mock.patch.dict(os.environ, {"FAKE_STATUS_JSON": json.dumps(invalid)}):
-                health = account_health(root, "person@example.com", gws_bin=str(fake))
+            fake = _fake_gws(tmp, "print(" + repr(json.dumps(invalid)) + ")\n")
+            health = account_health(root, "person@example.com", gws_bin=str(fake))
             self.assertEqual(health["state"], "invalid")
             self.assertFalse(health["valid"])
             self.assertTrue(health["reauth_required"])
             self.assertNotIn("secret", json.dumps(health))
 
             unreadable = {"auth_method": "none", "credentials_readable": False}
-            with mock.patch.dict(os.environ, {"FAKE_STATUS_JSON": json.dumps(unreadable)}):
-                health = account_health(root, "person@example.com", gws_bin=str(fake))
+            fake = _fake_gws(tmp, "print(" + repr(json.dumps(unreadable)) + ")\n")
+            health = account_health(root, "person@example.com", gws_bin=str(fake))
             self.assertEqual(health["state"], "unreadable")
             self.assertTrue(health["reauth_required"])
 
-    def test_public_execute_blocks_auth_but_internal_bounded_keeps_it(self):
-        from router import bounded_gws
+    def test_auth_is_blocked_except_internal_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "profile"
             _account(root)
-            fake = _fake_gws(tmp, "print('{\"refresh_token\": \"secret-refresh\"}')\n")
+            fake = _fake_gws(tmp, "print('{\"auth_method\": \"none\"}')\n")
             for argv in (["auth", "export", "--unmasked"], ["--format", "json", "auth", "export"],
-                         ["help", "auth", "export"]):
-                result = execute_gws(root, "person@example.com", argv, gws_bin=str(fake))
-                self.assertEqual(result["error_code"], "auth_blocked")
-                self.assertNotIn("secret", json.dumps(result))
-            internal = bounded_gws(root, "person@example.com", ["auth", "export"], gws_bin=str(fake))
+                         ["help", "auth", "export"], ["auth", "login"], ["auth", "logout"]):
+                with mock.patch("router.subprocess.run") as run:
+                    for call in (execute_gws, bounded_gws):
+                        result = call(root, "person@example.com", argv, gws_bin=str(fake))
+                        self.assertEqual(result["error_code"], "auth_blocked")
+                        self.assertNotIn("gws_login", json.dumps(result))
+                    run.assert_not_called()
+            internal = bounded_gws(root, "person@example.com", ["auth", "status"], gws_bin=str(fake))
             self.assertTrue(internal["ok"])
 
     def test_health_reports_only_sanitized_granted_scopes(self):

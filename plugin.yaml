@@ -1,16 +1,15 @@
-name: gws-oauth
-version: 0.8.0
+name: google-workspace
+version: 0.9.0
 manifest_version: 2
 kind: standalone
-description: Profile-scoped Google OAuth, curated Gmail/Drive/Calendar tools, approval-gated native gws access, and targeted watches
+description: Multi-account native gws adapter, curated Workspace tools, approvals, and targeted push watches
 license: MIT
 requires_hermes: ">=0.23.2"
 python_dependencies:
   - PyYAML>=6,<7
   - aiohttp>=3.9,<4
+  - google-auth[requests]>=2.40,<3
 provides_tools:
-  - gws_login
-  - gws_logout
   - gws_accounts
   - gws_api
   - gws_gmail_watch
@@ -44,11 +43,23 @@ config_schema:
   watch_gmail_subscription:
     type: str
     default: ""
-    description: Exact Pub/Sub subscription the worker may pull, e.g. projects/PROJECT/subscriptions/gmail-watch
+    description: Exact operator-provisioned authenticated push subscription, e.g. projects/PROJECT/subscriptions/gmail-watch
   watch_callback_url:
     type: str
     default: ""
     description: Public HTTPS base that a reverse proxy/tunnel forwards to the worker's loopback callback receiver
+  watch_gmail_push_audience:
+    type: str
+    default: ""
+    description: Exact HTTPS audience configured on the authenticated Pub/Sub push subscription
+  watch_gmail_push_service_account:
+    type: str
+    default: ""
+    description: Exact Google service-account email authorized to push Gmail notifications
+  watch_routes:
+    type: dict
+    default: {routes: []}
+    description: Operator-provisioned Hermes webhook routes bound to exact profile, principal, chat and delivery mode
   watch_reconcile_seconds:
     type: int
     default: 300

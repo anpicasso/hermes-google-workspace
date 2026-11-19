@@ -39,9 +39,9 @@ jobs:
         working-directory: hermes-agent
         run: |
           uv sync --locked --python 3.14 --no-dev
-          # Plugin runtime deps, pinned to the versions in Hermes' uv.lock.
+          # PyYAML/aiohttp match Hermes' lock; google-auth uses the plugin's supported range.
           # aiohttp is only a Hermes extra, so install it explicitly.
-          uv pip install --python .venv/bin/python "PyYAML==6.0.3" "aiohttp==3.14.5"
+          uv pip install --python .venv/bin/python "PyYAML==6.0.3" "aiohttp==3.14.5" "google-auth[requests]>=2.40,<3"
           echo "HERMES_PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
           echo "HERMES_AGENT_SRC=$PWD" >> "$GITHUB_ENV"
 

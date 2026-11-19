@@ -1,63 +1,32 @@
 # Compatibility
 
-**Runtime compatibility is not catalog eligibility.** Read the [policy disclaimer](catalog-policy.md); a green validator or CI run does not waive the credential-policy blocker.
+Runtime compatibility is not [catalog eligibility](catalog-policy.md). The public plugin is `google-workspace` v0.9.0; the optional private `hermes-gws-remote-auth` companion is a separate installation.
 
-## Tested combination
+## Pinned baseline
 
-The CI workflow (`.github/workflows/ci.yml`) covers exactly this setup:
+The repository tests/CI pin Hermes commit `f7e2898aaefc8f967dbf7345e3999a65672fe60e` and native `gws` 0.22.5. The `requires_hermes: >=0.23.2` manifest gate is not evidence that every newer host works, nor a claim that this worktree has passed CI.
 
-| Component | Version |
-|-----------|---------|
-| Hermes Agent | commit `f7e2898aaefc8f967dbf7345e3999a65672fe60e` (reports `0.23.2`, a canary build after the `v0.23.2` tag) |
-| Python | 3.14, from Hermes' `uv.lock` (`uv sync --locked --python 3.14 --no-dev`) |
-| Native `gws` | 0.22.5 (release tarball, SHA-256 checked) |
-| PyYAML | 6.0.3 (same pin as Hermes' `uv.lock`) |
-| aiohttp | 3.14.5 (same pin as Hermes' `messaging` extra; required by the watch worker) |
+[The workflow](../.github/workflows/ci.yml) is the reproducible environment specification: Python 3.14 with the pinned Hermes lockfile, PyYAML 6.0.3, aiohttp 3.14.5, `google-auth[requests]>=2.40,<3`, and a checksum-verified native CLI. It runs unittest discovery with isolated homes and no inherited Google credentials, rejects skips, then runs plugin validation and Doctor. Do not duplicate that setup with an unpinned host and call it the same baseline.
 
-The suite has also passed against runtime commit
-`aaec1339aa325888919c522911c54a7e684c7f23`. This does not establish support for
-every intervening release. Matching version numbers alone do not count. The
-`requires_hermes` floor in `plugin.yaml` is a gate that stops installs on
-Hermes versions known to be too old. It does not mean every newer version has
-been tested.
+## Required public host surfaces
 
-The plugin depends on these host surfaces:
-- the `pre_tool_call` `approve` directive and the approval gate in
-  `model_tools.handle_function_call` (covered by `tests/test_api_policy.py::HostDispatchTests`)
-- `ctx.register_tool`, `ctx.register_hook`, `ctx.inject_message`
-- the private imports `gateway.session_context.bound_session_key` and
-  `hermes_cli.webhook`, which `hermes plugins validate` flags because any
-  release can break them
+- Tool, hook and command registration; trusted command-dispatch `source`, `session_id`, `session_key` and `platform` context for `/gws-bind`.
+- `pre_tool_call` approval directives and the actual host approval dispatcher.
+- Native generic-HMAC webhook ingress provisioned by the operator.
+- For same-session delivery: `pre_gateway_dispatch` with a usable session store and public `ctx.inject_message(session_key=...)`, plus explicit `allow_gateway_injection` consent.
 
-## What CI runs
+There is no private webhook routing dependency or process-global origin fallback. The [route contract](routes-contract.md) records the inspected host seams and limits. A host without trusted physical-session binding cannot safely start watches. A hosted-isolation placeholder session store cannot support the same-session precheck; use `new_session` rather than weakening isolation. Callable injection alone does not prove consent or delivery.
 
-1. Checks out Hermes at the pinned commit and installs its locked runtime
-   environment, then installs PyYAML and aiohttp explicitly.
-2. Installs native `gws` 0.22.5.
-3. Runs every unittest with `HERMES_AGENT_SRC` set to that checkout, using an
-   empty `HOME`/`HERMES_HOME` and no `GOOGLE_*` variables. The job fails if any
-   test is skipped. That makes the real-host approval dispatch tests and the
-   native `gws --dry-run` tests mandatory. No Google credentials are present,
-   and no Google API calls are made.
-4. Runs `hermes plugins validate <plugin> --json` and `hermes plugins doctor <plugin> --ci`.
+The watch worker requires POSIX advisory locking; Windows worker startup is unsupported. Use a dependency-complete Python environment and a separate worker for each exact profile home. Non-watch portability is not a claim of tested Windows support.
 
-## Verify locally
+## Verification scope
+
+From the plugin root, in the workflow's isolated environment:
 
 ```bash
-SCRATCH=${TMPDIR:-/tmp}/gws-ci
-git clone https://github.com/NousResearch/hermes-agent "$SCRATCH/hermes-agent"
-git -C "$SCRATCH/hermes-agent" checkout f7e2898aaefc8f967dbf7345e3999a65672fe60e
-(cd "$SCRATCH/hermes-agent" && uv sync --locked --python 3.14 --no-dev &&
-  uv pip install --python .venv/bin/python PyYAML==6.0.3 aiohttp==3.14.5)
-H="$SCRATCH/hermes-agent"; PY="$H/.venv/bin/python"
-
-# from the plugin checkout; gws 0.22.5 must be on PATH
-env -i PATH="$PATH" HOME="$(mktemp -d)" HERMES_HOME="$(mktemp -d)" \
-  HERMES_DISABLE_LAZY_INSTALLS=1 HERMES_AGENT_SRC="$H" PYTHONPATH="$H" \
-  "$PY" -m unittest discover -s tests -v      # check that the output shows no "skipped"
-
-(cd "$H" && HERMES_HOME="$(mktemp -d)" HERMES_DISABLE_LAZY_INSTALLS=1 \
-  "$PY" -m hermes_cli.main plugins validate "$OLDPWD" --json &&
-  HERMES_HOME="$(mktemp -d)" HERMES_DISABLE_LAZY_INSTALLS=1 \
-  "$PY" -m hermes_cli.main plugins doctor "$OLDPWD" --ci)
+python -m unittest discover -s tests -v
+hermes plugins validate . --json
+hermes plugins doctor . --ci
 ```
+
+Inspect skips and failures rather than quoting historical passing counts. Tests exercise simulated Google transport, synthetic identities, loopback HTTP, native dry-run behavior and selected real public host entry points. They do not establish real Google consent, live authenticated Pub/Sub push, remote receiver configuration, agent execution or external message delivery. Those require separate operator-controlled checks before release/deployment. Revalidate public command, approval, webhook and injection behavior when upgrading Hermes or `gws`.

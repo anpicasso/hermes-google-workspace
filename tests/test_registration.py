@@ -1,150 +1,107 @@
-"""The distributed package registers all three agent tools."""
+"""Public plugin loads independently; account lifecycle and origins fail closed."""
+import asyncio
 import importlib.util
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("gws_oauth_test", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
+spec = importlib.util.spec_from_file_location("gws_public_test", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
 plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 
 class RegistrationTests(unittest.TestCase):
-    def test_plugin_exposes_login_and_profile_tools(self):
-        tools = {}
-        starts = []
-        finishes = []
-        actions = []
-        manager = SimpleNamespace(
-            status=lambda *a, **kw: actions.append(("status", a, kw)) or {"ok": True},
-            cancel=lambda *a, **kw: actions.append(("cancel", a, kw)) or {"ok": True},
-            logout=lambda root, account, remove: remove(),
-            close=lambda: None,
-            start=lambda *args, **kwargs: starts.append((args, kwargs)) or {"ok": True},
-            finish=lambda *args, **kwargs: finishes.append((args, kwargs)) or {"ok": True},
-        )
-        ctx = SimpleNamespace(
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.active_home = self.home
+        self.tools, self.commands, self.hooks = {}, {}, {}
+        self.home_patch = patch("hermes_constants.get_hermes_home", side_effect=lambda: self.active_home)
+        self.home_patch.start()
+        self.addCleanup(self.home_patch.stop)
+        self.ctx = SimpleNamespace(profile_name="default",
             get_config=lambda key, default=None: default,
-            register_tool=lambda **kwargs: tools.setdefault(kwargs["name"], kwargs),
-            register_hook=lambda name, callback: None,
-            on_unload=lambda callback: None,
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            hermes_constants = ModuleType("hermes_constants")
-            setattr(hermes_constants, "get_hermes_home", lambda: home)
-            gateway = ModuleType("gateway")
-            setattr(gateway, "__path__", [])
-            session_context = ModuleType("gateway.session_context")
-            session = {
-                "HERMES_SESSION_PLATFORM": "discord",
-                "HERMES_SESSION_CHAT_ID": "thread-1",
-                "HERMES_SESSION_USER_ID": "user-1",
-                "HERMES_SESSION_CHAT_TYPE": "thread",
-                "HERMES_SESSION_PROFILE": "default",
-            }
-            setattr(session_context, "get_session_env", session.get)
-            with patch.object(plugin, "LoginManager", return_value=manager):
-                with patch.dict(sys.modules, {
-                    "hermes_constants": hermes_constants,
-                    "gateway": gateway,
-                    "gateway.session_context": session_context,
-                }):
-                    plugin.register(ctx)
-            state_dir = home / "gws-oauth"
-            self.assertTrue(state_dir.is_dir())
-            self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
-            self.assertFalse((state_dir / "client_secret.json").exists())
-            from gws_oauth_test.workspace_tools import SCHEMAS
-            self.assertEqual(set(tools), {"gws_login", "gws_logout", "gws_accounts", "gws_api",
-                                          "gws_gmail_watch", "gws_drive_watch",
-                                          "gws_calendar_watch"} | set(SCHEMAS))
-            self.assertEqual(starts, [])
-            self.assertEqual(tools["gws_login"]["schema"]["parameters"]["properties"]
-                             ["scope_mode"]["default"], "full")
-            for name in ("gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"):
-                schema = tools[name]["schema"]
-                self.assertEqual(schema["parameters"]["properties"]["action"]["enum"],
-                                 ["start", "status", "stop"])
-                self.assertFalse(schema["parameters"]["additionalProperties"])
-            self.assertNotIn("gws_watch", tools)
-            result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com"}))
-            self.assertTrue(result["ok"])
-            self.assertEqual(starts[0][0][1:5], ("discord", "thread-1", "user-1", "user@example.com"))
-            for action in ("status", "cancel"):
-                result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com", "action": action}))
-                self.assertTrue(result["ok"])
-                self.assertEqual(actions[-1], (action, starts[0][0][:5], {"profile": "default"}))
-            self.assertEqual(len(starts), 1)
-            for invalid in ({"action": "bad"}, {"action": "cancel", "callback_url": "localhost:1/?code=fixture"}):
-                self.assertEqual(json.loads(tools["gws_login"]["handler"](
-                    {"account": "user@example.com", **invalid}))["reason"], "invalid_arguments")
-            for platform in ("cli", "tui", "desktop", "api_server", "custom_ui"):
-                session.clear()
-                session.update(HERMES_SESSION_SOURCE=platform, HERMES_SESSION_ID="terminal-1")
-                handler = tools["gws_login"]["handler"]
-                self.assertTrue(json.loads(handler({"account": "user@example.com"}))["ok"])
-                self.assertEqual(starts[-1][0][1:5], (platform, "terminal-1", "local", "user@example.com"))
-                self.assertIsNone(starts[-1][0][6], "non-gateway sessions must not register an input hook")
-                callback = "localhost:1234/?code=fixture"
-                self.assertTrue(json.loads(handler({"account": "user@example.com", "callback_url": callback}))["ok"])
-                self.assertEqual(finishes[-1][0][1:], (platform, "terminal-1", "local", "user@example.com", callback))
-                self.assertTrue(json.loads(handler({"account": "user@example.com"}, session_id="terminal-2"))["ok"])
-                self.assertEqual(starts[-1][0][2], "terminal-2")
-                self.assertTrue(json.loads(handler({"account": "user@example.com", "callback_url": None}))["ok"])
-                self.assertEqual(starts[-1][0][2], "terminal-1")
-            session.update(HERMES_SESSION_SOURCE="desktop", HERMES_SESSION_USER_ID="browser-user")
-            handler({"account": "user@example.com"}, session_id="desktop-session")
-            self.assertEqual(starts[-1][0][1:4], ("desktop", "desktop-session", "browser-user"))
-            session.update(HERMES_SESSION_PLATFORM="telegram", HERMES_SESSION_CHAT_ID="shared-chat",
-                           HERMES_SESSION_USER_ID="")
-            handler({"account": "user@example.com"}, session_id="do-not-substitute")
-            self.assertEqual(starts[-1][0][1:4], ("telegram", "shared-chat", ""))
-            self.assertIn("callback_url", tools["gws_login"]["schema"]["parameters"]["properties"])
-            self.assertIn("reauthorize", tools["gws_login"]["schema"]["parameters"]["properties"])
-            self.assertIn("check_health", tools["gws_accounts"]["schema"]["parameters"]["properties"])
+            register_tool=lambda **kw: self.tools.setdefault(kw["name"], kw),
+            register_hook=lambda name, cb: self.hooks.setdefault(name, cb),
+            register_command=lambda name, cb, **kw: self.commands.setdefault(name, cb),
+            on_unload=lambda cb: None)
+        plugin.register(self.ctx)
 
-            handler = tools["gws_login"]["handler"]
-            self.assertTrue(json.loads(handler({"account": "user@example.com", "reauthorize": True}))["ok"])
-            self.assertIs(starts[-1][1]["reauthorize"], True)
+    def call(self, name, args, **kwargs):
+        return json.loads(self.tools[name]["handler"](args, **kwargs))
 
-            account = state_dir / "accounts" / "user@example.com"
-            account.mkdir(parents=True)
-            (account / "credentials.enc").write_text("fixture")
-            plain = json.loads(tools["gws_accounts"]["handler"]({}))
-            self.assertEqual(plain, {"ok": True, "accounts": ["user@example.com"]})
-            with patch.object(plugin, "account_health", return_value={"state": "valid", "stored": True,
-                                                                      "valid": True, "reauth_required": False}):
-                checked = json.loads(tools["gws_accounts"]["handler"]({"check_health": True}))
-            self.assertEqual(checked["accounts"], ["user@example.com"])
-            self.assertEqual(checked["health"]["user@example.com"]["state"], "valid")
-            from gws_oauth_test.watch import WatchStore
-            store = WatchStore(home)
-            store.add_watch({"watch_id": "logout-test", "service": "gmail",
-                "account": "user@example.com", "profile": "default", "principal": "u",
-                "origin": {}, "mode": "new_session", "target": {}, "filters": {},
-                "instructions": "", "skills": [], "minutes": 1, "batch_seconds": 0,
-                "stop_after_match": False, "created_at": 1, "not_before": 1,
-                "expires_at": 2, "fingerprint": "logout-test"})
-            logout = tools["gws_logout"]["handler"]
-            for state, cleanup in (("active", "none"), ("matched", "done"), ("stopped", "pending")):
-                store.update_watch("logout-test", state=state, cleanup_state=cleanup)
-                self.assertEqual(json.loads(logout({"account": "user@example.com"}))["error_code"], "watches_active")
-                self.assertEqual(json.loads(logout({"account": "User@Example.com"}))["error_code"], "watches_active")
-                self.assertTrue((account / "credentials.enc").exists())
-            store.update_watch("logout-test", state="stopped", cleanup_state="done")
-            result = json.loads(logout({"account": "user@example.com"}))
-            self.assertTrue(result["removed"])
-            self.assertFalse(result["remote_revoked"])
-            self.assertFalse(account.exists())
-            self.assertFalse(json.loads(logout({"account": "user@example.com"}))["removed"])
-            self.assertEqual(json.loads(logout({"account": "../oops"}))["error_code"], "invalid_arguments")
+    def test_public_only_tools_and_no_credential_creation(self):
+        from gws_public_test.workspace_tools import SCHEMAS
+        self.assertEqual(set(self.tools), {"gws_accounts", "gws_api", "gws_gmail_watch",
+            "gws_drive_watch", "gws_calendar_watch"} | set(SCHEMAS))
+        self.assertNotIn("gws_public_test.oauth", sys.modules)
+        self.assertEqual(set(self.commands), {"gws-bind"})
+        self.assertFalse((self.home / "gws-oauth").exists())
+        self.assertEqual(self.call("gws_accounts", {}), {"ok": True, "accounts": []})
+
+    def test_accounts_health_and_filter(self):
+        for name in ("alice@example.com", "bob@example.com"):
+            slot = self.home / "gws-oauth" / "accounts" / name
+            slot.mkdir(parents=True)
+            (slot / "credentials.enc").write_text("synthetic")
+        with patch.object(plugin, "account_health", return_value={"state": "stored"}) as health:
+            result = self.call("gws_accounts", {"account": "ALICE@example.com", "check_health": True})
+        self.assertEqual(result["accounts"], ["alice@example.com"])
+        health.assert_called_once()
+
+    def test_lifecycle_contract_covers_pending_cleanup(self):
+        from gws_public_test.watch import WatchStore
+        store = WatchStore(self.home)
+        query = {"account": "USER@example.com", "check_lifecycle": True}
+        expected = {"ok": True, "contract": "gws-account-lifecycle-v1",
+                    "account": "user@example.com", "credentials_in_use": False}
+        self.assertEqual(self.call("gws_accounts", query), expected)
+        store.add_watch({"watch_id": "lifecycle-test", "service": "gmail",
+            "account": "user@example.com", "profile": "default", "principal": "u",
+            "origin": {}, "mode": "new_session", "target": {}, "filters": {},
+            "instructions": "", "skills": [], "minutes": 1, "batch_seconds": 0,
+            "stop_after_match": False, "created_at": 1, "not_before": 1,
+            "expires_at": 2, "fingerprint": "lifecycle-test"})
+        for state, cleanup in (("active", "none"), ("matched", "done"), ("stopped", "pending")):
+            store.update_watch("lifecycle-test", state=state, cleanup_state=cleanup)
+            self.assertTrue(self.call("gws_accounts", query)["credentials_in_use"])
+        store.update_watch("lifecycle-test", state="stopped", cleanup_state="done")
+        self.assertEqual(self.call("gws_accounts", query), expected)
+        for args in ({"check_lifecycle": True}, {"account": "../bad"}, {"check_health": "false"},
+                     {**query, "check_health": True}):
+            self.assertFalse(self.call("gws_accounts", args)["ok"])
+
+    def test_every_tool_rejects_profile_mismatch(self):
+        self.active_home = self.home / "other-profile"
+        for name in self.tools:
+            self.assertEqual(self.call(name, {})["error_code"], "profile_mismatch", name)
+        self.assertIn("refused", asyncio.run(self.commands["gws-bind"]()))
+
+    def test_watch_does_not_borrow_environment_origin(self):
+        import os
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "parent", "HERMES_SESSION_KEY": "route",
+                                     "HERMES_SESSION_USER_ID": "user"}):
+            result = self.call("gws_gmail_watch", {"action": "status"}, session_id="child")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "no_trusted_origin")
+
+    def test_bound_origin_uses_physical_id(self):
+        from gws_public_test import watch_tools
+        source = SimpleNamespace(platform="discord", user_id="u", chat_id="c", thread_id="t")
+        result = asyncio.run(self.commands["gws-bind"]("", source=source, platform="discord",
+                            session_id="physical", session_key="logical"))
+        self.assertIn("bound", result)
+        with patch.object(watch_tools, "handle", side_effect=lambda service, args, rt, **kw: rt.origin(kw["session_id"])):
+            origin = self.call("gws_gmail_watch", {"action": "status"}, session_id="physical")
+            self.assertEqual(origin["session_key"], "logical")
+            self.assertFalse(self.call("gws_gmail_watch", {"action": "status"}, session_id="child")["ok"])
 
 
 if __name__ == "__main__":

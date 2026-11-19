@@ -1,116 +1,162 @@
-"""Offline transport checks: fake credentials and HTTP only, no Google calls."""
-import io
+"""Offline PUSH verification with real RSA signatures and official google-auth."""
+import asyncio
+import base64
 import json
-import os
-import subprocess
+import sys
 import tempfile
+import time
 import unittest
-import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from google.auth import crypt, jwt
+from google.auth.transport import requests as google_requests
+
+import watch
 import watch_pubsub as P
-from watch_worker import GwsClient
+from watch_worker import Worker, CallbackServer
+from fake_google import FakeGoogle as OriginalGoogle
+from watch_helpers import runtime as original_runtime, Clock, FakeRoutes, start_gmail
+
+PUSH_CONFIG = {"watch_gmail_push_audience": "https://watch.example.invalid/google/gmail",
+               "watch_gmail_push_service_account": "gmail-push@project.iam.gserviceaccount.com"}
+
+
+def runtime(*args, config=None, **kwargs):
+    return original_runtime(*args, config={**PUSH_CONFIG, **(config or {})}, **kwargs)
+
+
+FakeGoogle = OriginalGoogle
+
+def envelope(address="person@example.com", history=101, **overrides):
+    data = base64.b64encode(json.dumps({"emailAddress": address, "historyId": history}).encode()).decode()
+    return json.dumps({"subscription": "projects/p/subscriptions/s",
+                       "message": {"messageId": "synthetic-101", "data": data}, **overrides}).encode()
 
 
 class PubSubTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                serialization.NoEncryption())
+        cls.signer = crypt.RSASigner.from_string(pem, key_id="synthetic")
+        cls.public = key.public_key().public_bytes(serialization.Encoding.PEM,
+                                                  serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
-        self.client = GwsClient(self.home)
-        for name in ("one@example.com", "two@example.com"):
-            path = self.home / "gws-oauth" / "accounts" / name
-            path.mkdir(parents=True)
-            (path / "credentials.enc").write_bytes(b"fake-encrypted-fixture")
-        self.credentials = {"type": "authorized_user", "client_id": "fixture-id",
-                            "client_secret": "fixture-secret", "refresh_token": "fixture-refresh"}
-        self.export = patch.object(P.subprocess, "run", side_effect=self.exported).start()
-        self.real_post = P._post
-        self.http = patch.object(P, "_post", side_effect=self.response).start()
-        self.addCleanup(patch.stopall)
-        self.requests = []
+        self.clock = Clock()
+        self.store = watch.WatchStore(self.home, clock=self.clock)
+        self.client, self.routes = FakeGoogle(), FakeRoutes()
+        self.rt = runtime(self.store, self.client, self.routes)
+        result = start_gmail(self.rt, batch_seconds=0)
+        self.assertTrue(result["ok"], result)
+        self.row = self.store.get_watch(result["watch"]["watch_id"])
+        self.source = self.store.sources_for(self.row["watch_id"])[0]
+        # Replace certificate HTTP only, NOT the verifier or JWT decoder.
+        def certs(request, url, method="GET", **kwargs):
+            self.assertEqual(url, "https://www.googleapis.com/oauth2/v1/certs")
+            self.assertEqual(kwargs["timeout"], 10)
+            return SimpleNamespace(status=200, data=json.dumps({"synthetic": self.public}).encode())
+        self.certs = patch.object(google_requests.Request, "__call__", certs)
+        self.certs.start()
+        self.addCleanup(self.certs.stop)
 
-    def exported(self, args, **kwargs):
-        self.assertEqual(args, ["gws", "auth", "export", "--unmasked"])
-        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
-        self.assertEqual(kwargs["env"]["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"], "file")
-        self.assertNotIn("GOOGLE_WORKSPACE_CLI_TOKEN", kwargs["env"])
-        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", kwargs["env"])
-        return subprocess.CompletedProcess(args, 0, json.dumps(self.credentials).encode())
+    def token(self, **overrides):
+        now = int(time.time())
+        claims = {"iss": "https://accounts.google.com", "aud": PUSH_CONFIG["watch_gmail_push_audience"],
+                  "email": PUSH_CONFIG["watch_gmail_push_service_account"], "email_verified": True,
+                  "sub": "synthetic-service-account", "iat": now - 1, "exp": now + 300}
+        return jwt.encode(self.signer, {**claims, **overrides}).decode()
 
-    def response(self, url, data, headers, timeout, *args):
-        self.requests.append((url, data, headers))
-        if url == P._TOKEN_URL:
-            return {"access_token": "fixture-access", "expires_in": 3600}
-        return {}
+    def push(self, body=None, token=None, config=None):
+        return P.process_push(self.store, config or self.rt.config,
+                              {"Authorization": "Bearer " + (token or self.token())},
+                              envelope() if body is None else body)
 
-    def call(self, operation="pull", body=None, account="one@example.com", subscription=None):
-        return self.client.call(account, ["pubsub:v1", "projects", "subscriptions", operation],
-                                {"subscription": subscription or "projects/example/subscriptions/watch"},
-                                body=body or {"maxMessages": 20, "returnImmediately": True})
+    def test_real_signature_durable_replay_restart_and_forward(self):
+        self.assertEqual(self.push()[0], 204)
+        self.assertEqual(len(self.store.pending_hints()), 1)
+        self.store = watch.WatchStore(self.home, clock=self.clock)
+        self.assertEqual(self.push()[0], 204)
+        self.assertEqual(len(self.store.pending_hints()), 1)
+        self.client.add_message("m1", "T1", internal_date="1800000000000")
+        self.client.add_history(101, "m1")
+        worker = Worker(self.home, self.client, self.routes, self.rt.config,
+                        store=self.store, clock=self.clock)
+        worker.run_once()
+        self.assertEqual(self.store.pending_hints(), [])
+        self.assertEqual(len(self.routes.posts), 1)
+        self.assertEqual(self.push()[0], 204)
+        worker.run_once()
+        self.assertEqual(len(self.routes.posts), 1)
+        self.assertFalse(any(c["args"][0].startswith("pubsub") for c in self.client.calls))
 
-    def test_real_worker_dispatch_cache_and_account_isolation(self):
-        with patch.dict(os.environ,
-                        {"GOOGLE_WORKSPACE_CLI_TOKEN": "wrong", "GOOGLE_APPLICATION_CREDENTIALS": "wrong"}):
-            self.assertTrue(self.call()["ok"])
-            self.assertTrue(self.call("acknowledge", {"ackIds": ["ack-1"]})["ok"])
-            self.assertTrue(self.call(account="two@example.com")["ok"])
-        self.assertEqual(sum(url == P._TOKEN_URL for url, _, _ in self.requests), 2)
-        self.assertEqual(json.loads(self.requests[2][1]), {"ackIds": ["ack-1"]})
-        self.assertTrue(self.requests[2][0].endswith(":acknowledge"))
-        self.assertEqual(self.requests[1][2]["Authorization"], "Bearer fixture-access")
-        paths = [call.kwargs["env"]["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] for call in self.export.call_args_list]
-        self.assertTrue(paths[0].endswith("one@example.com"))
-        self.assertTrue(paths[-1].endswith("two@example.com"))
+    def test_signed_wrong_claims_fail_closed(self):
+        for claims in ({"aud": "wrong"}, {"iss": "https://evil.invalid"}, {"exp": 1},
+                       {"iat": int(time.time()) + 1000}, {"email": "other@project.iam.gserviceaccount.com"},
+                       {"email_verified": False}, {"email_verified": "true"}):
+            with self.subTest(claims=claims):
+                self.assertEqual(self.push(token=self.token(**claims))[0], 403)
+        self.assertEqual(self.store.pending_hints(), [])
 
-    def test_reauthorization_and_expiry_refresh(self):
-        self.assertTrue(self.call()["ok"])
-        self.credentials["refresh_token"] = "fixture-replaced"
-        self.assertTrue(self.call()["ok"])
-        key = "one@example.com"
-        fp, access, _ = self.client.pubsub._tokens[key]
-        self.client.pubsub._tokens[key] = (fp, access, 0)
-        self.assertTrue(self.call()["ok"])
-        self.assertEqual(sum(url == P._TOKEN_URL for url, _, _ in self.requests), 3)
+    def test_signature_tampering_and_missing_auth(self):
+        token = self.token()
+        parts = token.split('.')
+        signature = bytearray(base64.urlsafe_b64decode(parts[2] + '=='))
+        signature[0] ^= 1
+        parts[2] = base64.urlsafe_b64encode(signature).decode().rstrip('=')
+        self.assertEqual(self.push(token='.'.join(parts))[0], 403)
+        self.assertEqual(P.process_push(self.store, self.rt.config, {}, envelope())[0], 401)
 
-    def test_invalid_destination_operation_and_account_never_export(self):
-        for sub in ("projects/p/subscriptions/../bad", "https://evil.test", "projects/p/subscriptions/x?token=x"):
-            self.assertFalse(self.call(subscription=sub)["ok"])
-        self.assertFalse(self.call(operation="delete")["ok"])
-        self.assertFalse(self.call(account="../escape")["ok"])
-        self.export.assert_not_called()
-        self.http.assert_not_called()
+    def test_config_body_subscription_and_mailbox_boundaries(self):
+        for key in (*PUSH_CONFIG, "watch_gmail_topic", "watch_gmail_subscription", "watch_callback_url"):
+            self.assertEqual(self.push(config={**self.rt.config, key: ""})[0], 503)
+        self.assertEqual(self.push(body=b'x' * (P.MAX_BODY + 1))[0], 413)
+        self.assertEqual(self.push(body=envelope(subscription="projects/p/subscriptions/other"))[0], 400)
+        self.assertEqual(self.push(body=envelope(address="foreign@example.com"))[0], 404)
+        for history in (True, -1, 1.5, "abc", "1" * 41):
+            self.assertEqual(self.push(body=envelope(history=history))[0], 400)
+        for body in (b'[]', b'{}', b'null', b'{', envelope(message={"messageId": "x", "data": "!!!"})):
+            self.assertEqual(self.push(body=body)[0], 400)
+        self.assertEqual(self.store.pending_hints(), [])
 
-    def test_failures_are_secret_free_and_401_clears_cache(self):
-        self.assertTrue(self.call()["ok"])
-        self.http.side_effect = urllib.error.HTTPError("https://pubsub.googleapis.com", 401,
-                                                       "fixture-secret", {}, io.BytesIO(b"fixture-refresh"))
-        result = self.call()
-        self.assertEqual(result["http_status"], 401)
-        self.assertNotIn("fixture", json.dumps(result))
-        self.assertEqual(self.client.pubsub._tokens, {})
-        self.export.side_effect = subprocess.TimeoutExpired("fixture-secret", 30, output=b"fixture-refresh")
-        self.assertNotIn("fixture", json.dumps(self.call()))
+    def test_database_failure_never_acknowledges(self):
+        with patch.object(self.store, "add_hint", side_effect=OSError("disk full")):
+            self.assertEqual(self.push()[0], 503)
+        with patch.object(self.store, "get_source", side_effect=OSError("database offline")):
+            self.assertEqual(self.push()[0], 503)
+        self.assertEqual(self.push()[0], 204)
 
-    def test_bad_export_and_untrusted_token_uri(self):
-        self.credentials["token_uri"] = "https://evil.test"
-        self.assertTrue(self.call()["ok"])
-        self.assertEqual(self.requests[0][0], P._TOKEN_URL)
-        del self.credentials["refresh_token"]
-        self.assertEqual(self.call()["error_code"], "pubsub_credentials")
-
-    def test_redirects_refused_and_response_bounded(self):
-        handler = P._NoRedirect()
-        self.assertIsNone(handler.redirect_request(None, None, 302, "", {}, "https://evil.test"))
-        # Exercise the real HTTP JSON reader with an in-memory response.
-        from unittest.mock import MagicMock
-        opener = MagicMock()
-        opener.open.return_value.__enter__.return_value.read.return_value = b"x" * 11
-        with patch.object(P.urllib.request, "build_opener", return_value=opener):
+    def test_loopback_http_endpoint_and_body_limit(self):
+        import aiohttp
+        async def run():
+            worker = Worker(self.home, self.client, self.routes, self.rt.config, store=self.store)
+            server = CallbackServer(worker, port=0)
+            await server.start()
+            try:
+                port = server.runner.addresses[0][1]
+                url = f'http://127.0.0.1:{port}/google/gmail'
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, data=envelope(), headers={"Authorization": "Bearer " + self.token()}) as response:
+                        self.assertEqual(response.status, 204)
+                    async with session.post(url, data=b'x' * (P.MAX_BODY + 1)) as response:
+                        self.assertEqual(response.status, 413)
+            finally:
+                await server.stop()
             with self.assertRaises(ValueError):
-                self.real_post("https://pubsub.googleapis.com", b"{}", {}, 1, limit=10)
+                await CallbackServer(worker, host="0.0.0.0", port=0).start()
+        asyncio.run(run())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

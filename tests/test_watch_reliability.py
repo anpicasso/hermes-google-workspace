@@ -16,6 +16,8 @@ import watch_routes
 import watch_worker
 from fake_google import FakeGoogle
 from watch_helpers import Clock, FakeRoutes, runtime, start_calendar, start_drive
+from test_watch_pubsub import runtime as push_runtime, FakeGoogle as PushGoogle
+from watch_helpers import start_gmail
 
 CAL = "cal-1"
 
@@ -46,6 +48,46 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         row = self.store.get_watch(result["watch"]["watch_id"])
         return row, self.store.sources_for(row["watch_id"])[0]
+
+    def test_gmail_fallback_is_periodic_not_every_worker_tick(self):
+        self.client = PushGoogle()
+        self.rt = push_runtime(self.store, self.client, self.routes)
+        result = start_gmail(self.rt)
+        self.assertTrue(result["ok"], result)
+        self.worker = self._worker()
+        self.worker.run_once()
+        self.assertFalse(any(c["args"][-2:] == ["history", "list"] for c in self.client.calls))
+        self.clock.advance(301)
+        self.worker.run_once()
+        count = sum(c["args"][-2:] == ["history", "list"] for c in self.client.calls)
+        self.assertEqual(count, 1)
+        self.worker.run_once()
+        self.assertEqual(sum(c["args"][-2:] == ["history", "list"] for c in self.client.calls), count)
+
+    def test_gmail_racing_and_staged_hints_survive_until_reconciled(self):
+        from unittest.mock import patch
+        self.client = PushGoogle()
+        self.rt = push_runtime(self.store, self.client, self.routes)
+        result = start_gmail(self.rt)
+        self.assertTrue(result["ok"], result)
+        source = self.store.sources_for(result["watch"]["watch_id"])[0]
+        self.worker = self._worker()
+        self.store.add_hint("old", source["source_id"], {"history_id": "100"})
+        def race(*args, **kwargs):
+            self.store.add_hint("new", source["source_id"], {"history_id": "102"})
+            return {"ok": True, "cursor": "101"}
+        with patch.object(watch_worker.watch_gmail, "drain", side_effect=race):
+            self.worker.drain_source(source)
+        self.assertEqual([h["hint_id"] for h in self.store.pending_hints()], ["new"])
+        with patch.object(watch_worker.watch_gmail, "drain", return_value={"ok": True, "staged": True}):
+            self.worker.drain_source(source)
+        self.assertEqual(len(self.store.pending_hints()), 1)
+        with patch.object(watch_worker.watch_gmail, "drain", return_value={"ok": True, "cursor": "101"}):
+            self.worker.drain_source(source)
+        self.assertEqual(len(self.store.pending_hints()), 1)
+        with patch.object(watch_worker.watch_gmail, "drain", return_value={"ok": True, "cursor": "102"}):
+            self.worker.drain_source(source)
+        self.assertEqual(self.store.pending_hints(), [])
 
     def test_calendar_drain_honours_start_barrier(self):
         row, source = self._calendar()
@@ -190,20 +232,20 @@ class ReliabilityTests(unittest.TestCase):
     def test_status_cli_exit_code(self):
         self.assertEqual(watch_worker.main(["status", "--home", str(self.home)]), 1)
 
-    def test_same_session_preflight_uses_host_permission(self):
-        inject = lambda content, *, session_key=None: True
-        denied = SimpleNamespace(inject_message=inject, _gateway_injection_allowed=lambda: False)
-        result = watch_routes.same_session_capability(denied)
-        self.assertEqual(result["error_code"], "same_session_not_permitted")
-        raising = SimpleNamespace(inject_message=inject,
-                                  _gateway_injection_allowed=lambda: 1 / 0)
-        self.assertFalse(watch_routes.same_session_capability(raising)["supported"])
-        allowed = SimpleNamespace(inject_message=inject, _gateway_injection_allowed=lambda: True)
-        self.assertTrue(watch_routes.same_session_capability(allowed)["supported"])
-        self.rt.ctx = denied
+    def test_same_session_preflight_uses_only_public_capability(self):
+        class PublicContext:
+            def inject_message(self, *args, **kwargs):
+                return False  # actual admission, not capability discovery, decides consent
+            @property
+            def _gateway_injection_allowed(self):
+                raise AssertionError("Private host API must not be inspected")
+        self.assertTrue(watch_routes.same_session_capability(PublicContext())["supported"])
+        unavailable = SimpleNamespace(inject_message=None)
+        self.assertFalse(watch_routes.same_session_capability(unavailable)["supported"])
+        self.rt.ctx = unavailable
         self.routes.same_session = True
         result = start_calendar(self.rt, target={"calendar_ids": [CAL]}, mode="same_session")
-        self.assertEqual(result["error_code"], "same_session_not_permitted")
+        self.assertFalse(result["ok"])
         self.assertEqual(self.store.list_watches(), [])
 
 

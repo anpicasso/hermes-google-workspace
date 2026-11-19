@@ -1,7 +1,7 @@
 """Real-host integration paths, isolated from the active profile.
 
-These tests exercise the installed Hermes webhook CAS helpers in a temporary
-home. They do not prove live Google delivery or native session execution.
+These checks exercise the public host injection API and side-effect-free
+registration. Operator route configuration is covered in test_watch_routes.
 """
 import json
 import os
@@ -31,49 +31,6 @@ class HostIntegrationTests(unittest.TestCase):
         self.patch.stop()
         self.tmp.cleanup()
 
-    def test_real_host_webhook_cas_round_trip(self):
-        manager = watch_routes.RouteManager(SimpleNamespace())
-        self.assertTrue(watch_routes.native_available())
-        watch = {"watch_id": "1234567890abcdef", "service": "gmail", "account": "person@example.com",
-                 "generation": 1}
-        spec = {"instructions": "Summarize the matching mail metadata", "skills": [],
-                "mode": "new_session", "account": "person@example.com"}
-        origin = {"profile": "default", "platform": "discord", "chat_id": "chat",
-                  "thread_id": "thread", "session_key": "k", "session_id": "s", "principal": "u"}
-        public = manager.create(watch, spec, origin)
-        path = self.home / "webhook_subscriptions.json"
-        self.assertTrue(path.is_file())
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        stored = json.loads(path.read_text())
-        route = stored[public["name"]]
-        self.assertEqual(route["description"], "gws-watch owned route watch=1234567890abcdef mode=new_session")
-        self.assertEqual(route["deliver"], "discord")
-        self.assertEqual(route["deliver_extra"]["chat_id"], "chat")
-        self.assertEqual(route["signature"], "generic")
-        self.assertEqual(route["watch_digest"], watch_routes._digest(route))
-        self.assertEqual(manager.remove(public["name"], watch["watch_id"])["state"], "removed")
-        self.assertEqual(json.loads(path.read_text()), {})
-
-    def test_real_host_route_disabled_is_not_recreated_or_removed(self):
-        manager = watch_routes.RouteManager(SimpleNamespace())
-        watch = {"watch_id": "abcdef1234567890", "service": "drive", "account": "person@example.com",
-                 "generation": 1}
-        spec = {"instructions": "x", "skills": [], "mode": "new_session",
-                "account": "person@example.com"}
-        origin = {"profile": "default", "platform": "discord", "chat_id": "chat",
-                  "thread_id": None, "session_key": "k", "session_id": "s", "principal": "u"}
-        public = manager.create(watch, spec, origin)
-        path = self.home / "webhook_subscriptions.json"
-        data = json.loads(path.read_text())
-        data[public["name"]]["enabled"] = False
-        path.write_text(json.dumps(data))
-        with self.assertRaises(watch_routes.RouteError) as raised:
-            manager.create(watch, spec, origin)
-        self.assertEqual(raised.exception.code, "native_route_disabled")
-        self.assertEqual(manager.remove(public["name"], watch["watch_id"])["state"],
-                         "preserved_disabled")
-        self.assertIn(public["name"], json.loads(path.read_text()))
-
     def test_installed_host_public_injection_uses_existing_session_key_api(self):
         from hermes_cli.plugins_context import PluginContext
         calls = {}
@@ -90,7 +47,7 @@ class HostIntegrationTests(unittest.TestCase):
                 return True
 
         fake_ctx = SimpleNamespace(
-            plugin_id="gws-oauth",
+            plugin_id="google-workspace",
             _manager=FakeManager(),
             _gateway_injection_allowed=lambda: True,
         )
@@ -109,17 +66,17 @@ class HostIntegrationTests(unittest.TestCase):
         spec.loader.exec_module(plugin)
         tools, hooks = {}, []
         ctx = SimpleNamespace(
+            profile_name="default",
+            register_command=lambda *args, **kwargs: None,
             get_config=lambda key, default=None: default,
             register_tool=lambda **kwargs: tools.setdefault(kwargs["name"], kwargs),
             register_hook=lambda name, callback: hooks.append(name),
             on_unload=lambda callback: None,
         )
-        with mock.patch("hermes_constants.get_hermes_home", return_value=self.home), \
-                mock.patch("gateway.session_context.get_session_env", return_value=None), \
-                mock.patch("gateway.session_context.bound_session_key", return_value=""):
+        with mock.patch("hermes_constants.get_hermes_home", return_value=self.home):
             plugin.register(ctx)
         from gws_oauth_int.workspace_tools import SCHEMAS
-        self.assertEqual(set(tools), {"gws_login", "gws_logout", "gws_accounts", "gws_api",
+        self.assertEqual(set(tools), {"gws_accounts", "gws_api",
                                       "gws_gmail_watch", "gws_drive_watch", "gws_calendar_watch"} | set(SCHEMAS))
         self.assertIn("pre_gateway_dispatch", hooks)
         self.assertIn("pre_tool_call", hooks)

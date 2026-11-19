@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import watch
 import watch_worker
-from fake_google import FakeGoogle, pubsub_message
-from watch_helpers import Clock, FakeRoutes, runtime, start_drive, start_gmail
+from test_watch_pubsub import FakeGoogle, runtime
+from watch_helpers import Clock, FakeRoutes, start_drive, start_gmail
 
 
 class WorkerTests(unittest.TestCase):
@@ -76,18 +76,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["sync"])
 
-    def test_run_once_gmail_pull_history_and_native_forward(self):
+    def test_run_once_gmail_hint_history_and_native_forward(self):
         watch_row = self._gmail()
         self.client.add_message("m1", "T1", sender="alice@example.com", subject="new invoice",
                                 internal_date="1800000000000")
         self.client.add_history(101, "m1")
-        self.client.gmail["pubsub"] = [[pubsub_message("person@example.com", "101")]]
+        source = self.store.sources_for(watch_row["watch_id"])[0]
+        self.store.add_hint("test-hint", source["source_id"], {"history_id": "101"})
         self.worker.run_once()
         self.assertTrue(self.client.gmail["watch_calls"] >= 1)
-        self.assertEqual(self.client.gmail["acknowledged"], [])  # fake records only calls; ack call exists
-        ack_calls = [call for call in self.client.calls
-                     if call["args"][-1:] == ["acknowledge"]]
-        self.assertTrue(ack_calls)
+        self.assertFalse(any(call["args"][0].startswith("pubsub") for call in self.client.calls))
         rows = self.store.outbox(watch_row["watch_id"])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "admitted")
@@ -98,15 +96,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.routes.posts[0]["request_id"],
                          json.loads(rows[0]["request_id"]) if rows[0]["request_id"] and rows[0]["request_id"].startswith('"') else rows[0]["request_id"])
 
-    def test_history_success_does_not_hide_pubsub_failure(self):
+    def test_history_success_does_not_hide_push_config_failure(self):
         row = self._gmail()
         source = self.store.sources_for(row["watch_id"])[0]
-        with mock.patch.object(watch_worker.watch_gmail, "pubsub_pull", return_value={
-                "ok": False, "error_code": "pubsub_pubsub"}):
-            self.assertTrue(self.worker.drain_source(source)["ok"])
-        self.assertEqual(self.store.get_source(source["source_id"])["last_error"], "pubsub_pubsub")
-        with mock.patch.object(watch_worker.watch_gmail, "pubsub_pull", return_value={"ok": True}):
-            self.worker.drain_source(self.store.get_source(source["source_id"]))
+        self.worker.config["watch_gmail_push_audience"] = ""
+        self.assertFalse(self.worker._ensure_gmail(source))
+        self.assertTrue(self.worker.drain_source(self.store.get_source(source["source_id"]))["ok"])
+        self.assertIn("audience", self.store.get_source(source["source_id"])["last_error"])
+        self.worker.config = dict(self.rt.config)
+        self.assertTrue(self.worker._ensure_gmail(source))
+        self.worker.drain_source(self.store.get_source(source["source_id"]))
         self.assertIsNone(self.store.get_source(source["source_id"])["last_error"])
 
     def test_native_retry_is_stable_and_does_not_claim_delivery(self):

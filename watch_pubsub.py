@@ -1,121 +1,121 @@
-"""Narrow Pub/Sub pull/ack transport; gws 0.22.5 cannot dispatch this API.
+"""Authenticated, operator-preprovisioned Pub/Sub PUSH; no OAuth credentials.
 
-Native gws decrypts the selected account. Exported credentials and refreshed
-access tokens stay in worker memory, never in results, logs, or spill files.
+Only Google's public signing certificates are fetched. The operator owns topic,
+subscription, IAM, OIDC audience/service account and HTTPS proxy provisioning.
 """
 from __future__ import annotations
 
-import hashlib
+import base64
 import json
 import re
-import subprocess
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
+from functools import partial
+from urllib.parse import urlsplit
 
 if __package__:
-    from .router import _account_env, _native_guard, account_dir
+    from . import watch as W
 else:
-    from router import _account_env, _native_guard, account_dir
+    import watch as W
 
-_SUBSCRIPTION = re.compile(r"projects/[A-Za-z0-9][A-Za-z0-9._~-]{0,127}/subscriptions/[A-Za-z][A-Za-z0-9._~+-]{2,254}\Z")
-_TOKEN_URL = "https://oauth2.googleapis.com/token"
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+MAX_BODY = 16 * 1024
+_RESOURCE = re.compile(r"projects/[A-Za-z0-9][A-Za-z0-9._~-]{0,127}/(topics|subscriptions)/[A-Za-z][A-Za-z0-9._~+-]{0,254}\Z")
 
 
-def _post(url, data, headers, timeout, limit=2_000_000):
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
-        raw = response.read(limit + 1)
-    if len(raw) > limit:
-        raise ValueError("response too large")
-    result = json.loads(raw)
-    if not isinstance(result, dict):
-        raise ValueError("invalid response")
-    return result
+def validate_config(config):
+    for key, kind, code in (("watch_gmail_topic", "topics", "gmail_topic"),
+                            ("watch_gmail_subscription", "subscriptions", "gmail_subscription")):
+        value = config.get(key)
+        if not value:
+            raise W.WatchError(code + "_missing", "Configure " + key + " before starting Gmail PUSH")
+        if not isinstance(value, str) or not _RESOURCE.fullmatch(value) or value.split('/')[2] != kind:
+            raise W.WatchError(code + ("_invalid" if kind == "topics" else "_missing"),
+                               key + " must be an exact projects/<project>/" + kind + "/<name>")
+    audience = config.get("watch_gmail_push_audience")
+    account = config.get("watch_gmail_push_service_account")
+    callback = config.get("watch_callback_url")
+    if (not isinstance(audience, str) or not audience or audience != audience.strip()
+            or len(audience) > 2048 or any(ord(c) < 33 for c in audience)):
+        raise W.WatchError("gmail_push_config", "Set watch_gmail_push_audience to the exact OIDC audience")
+    if (not isinstance(account, str) or not re.fullmatch(
+            r"[A-Za-z0-9._-]+@[A-Za-z0-9.-]+\.iam\.gserviceaccount\.com", account)):
+        raise W.WatchError("gmail_push_config", "Set watch_gmail_push_service_account to the exact service account email")
+    try:
+        url = urlsplit(callback if isinstance(callback, str) else "")
+        valid = (url.scheme == "https" and url.hostname and not url.username and not url.password
+                 and not url.query and not url.fragment and callback == callback.strip()
+                 and not any(ord(c) <= 32 for c in callback))
+        url.port
+    except ValueError:
+        valid = False
+    if not valid:
+        raise W.WatchError("gmail_push_config", "Set watch_callback_url to a public HTTPS base URL")
+    try:
+        from google.oauth2.id_token import verify_oauth2_token  # noqa: F401
+        from google.auth.transport.requests import Request  # noqa: F401
+    except ImportError as exc:
+        raise W.WatchError("gmail_push_dependency", "Gmail PUSH requires google-auth and requests") from exc
+    return audience, account
 
 
-class PubSubClient:
-    def __init__(self, root, gws_bin="gws"):
-        self.root = Path(root).resolve()
-        self.gws_bin = gws_bin
-        self._tokens = {}
+def verify_identity(token, audience, service_account):
+    from google.auth.transport.requests import Request
+    from google.oauth2.id_token import verify_oauth2_token
+    import requests
 
-    def call(self, account, operation, subscription, body, timeout=30):
-        if (operation not in ("pull", "acknowledge")
-                or not isinstance(subscription, str) or not _SUBSCRIPTION.fullmatch(subscription)
-                or not isinstance(body, dict)):
-            return {"ok": False, "error_code": "invalid_arguments", "retryable": False}
-        if operation == "pull":
-            valid = (set(body) <= {"maxMessages", "returnImmediately"}
-                     and type(body.get("maxMessages")) is int and 1 <= body["maxMessages"] <= 100
-                     and type(body.get("returnImmediately", False)) is bool)
-        else:
-            ids = body.get("ackIds")
-            valid = (set(body) == {"ackIds"} and isinstance(ids, list) and 1 <= len(ids) <= 100
-                     and all(isinstance(item, str) and 0 < len(item) <= 4096 for item in ids))
-        if not valid:
-            return {"ok": False, "error_code": "invalid_arguments", "retryable": False}
-        stage = "credentials"
-        try:
-            with _native_guard(self.root, account):
-                path = account_dir(self.root, account)
-                # Export every call so reauthorization invalidates the in-memory
-                # token immediately; no second credential store or login flow.
-                exported = subprocess.run(
-                    [self.gws_bin, "auth", "export", "--unmasked"],
-                    env=_account_env(path), stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    timeout=timeout, check=False,
-                )
-                if exported.returncode or len(exported.stdout) > 65536:
-                    raise ValueError("export failed")
-                credentials = json.loads(exported.stdout)
-                keys = ("client_id", "client_secret", "refresh_token")
-                if (not isinstance(credentials, dict)
-                        or credentials.get("type") != "authorized_user"
-                        or not all(isinstance(credentials.get(k), str)
-                                   and 0 < len(credentials[k]) <= 16384 for k in keys)):
-                    raise ValueError("unsupported credentials")
-                fingerprint = hashlib.sha256(json.dumps(
-                    [credentials[k] for k in keys], separators=(",", ":")).encode()).digest()
-                cached = self._tokens.get(account)
-                if not cached or cached[0] != fingerprint or cached[2] <= time.monotonic():
-                    self._tokens.pop(account, None)
-                    stage = "token"
-                    form = {k: credentials[k] for k in keys}
-                    form["grant_type"] = "refresh_token"
-                    token = _post(_TOKEN_URL, urllib.parse.urlencode(form).encode(),
-                                  {"Content-Type": "application/x-www-form-urlencoded"}, timeout, 65536)
-                    access = token.get("access_token")
-                    ttl = token.get("expires_in")
-                    if (not isinstance(access, str) or not access or len(access) > 16384
-                            or any(ord(c) < 33 or ord(c) > 126 for c in access)
-                            or type(ttl) is not int or not 0 < ttl <= 86400):
-                        raise ValueError("invalid token response")
-                    cached = (fingerprint, access, time.monotonic() + max(0, ttl - 60))
-                    self._tokens[account] = cached
-                stage = "pubsub"
-                data = _post(f"https://pubsub.googleapis.com/v1/{subscription}:{operation}",
-                             json.dumps(body, separators=(",", ":")).encode(),
-                             {"Content-Type": "application/json", "Authorization": "Bearer " + cached[1]},
-                             timeout)
-                return {"ok": True, "data": data}
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            exc.close()
-            if status == 401 or stage == "token":
-                self._tokens.pop(account, None)
-            return {"ok": False, "error_code": "pubsub_" + stage,
-                    "http_status": status, "retryable": status == 429 or status >= 500,
-                    "error": "Google rejected the request; check account authorization, Pub/Sub scope and IAM."}
-        except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-            return {"ok": False, "error_code": "pubsub_" + stage,
-                    "retryable": stage != "credentials",
-                    "error": "Pub/Sub transport failed; verify native gws encrypted account export and connectivity."}
+    # Official verifier checks signature, expiry, issued-at, audience and issuer.
+    # No ADC, account credential, OAuth export or token creation is involved.
+    with requests.Session() as session:
+        claims = verify_oauth2_token(token, partial(Request(session=session), timeout=10),
+                                     audience=audience)
+    return (claims.get("iss") in ("accounts.google.com", "https://accounts.google.com")
+            and claims.get("aud") == audience and claims.get("email") == service_account
+            and claims.get("email_verified") is True)
+
+
+def process_push(store, config, headers, body):
+    """Return HTTP status only after a validated hint is durable; replay is safe."""
+    if len(body) > MAX_BODY:
+        return 413, {"ok": False, "error": "body too large"}
+    try:
+        audience, service_account = validate_config(config)
+    except W.WatchError as exc:
+        return 503, exc.as_dict()
+    authorization = headers.get("Authorization", "")
+    if (not isinstance(authorization, str) or not authorization.startswith("Bearer ")
+            or not 0 < len(authorization[7:]) <= 8192):
+        return 401, {"ok": False, "error": "missing OIDC bearer"}
+    try:
+        if not verify_identity(authorization[7:], audience, service_account):
+            raise ValueError("identity mismatch")
+    except Exception:
+        # Never reflect JWTs or verifier error details into responses/logs.
+        return 403, {"ok": False, "error": "OIDC verification failed"}
+    try:
+        envelope = json.loads(body)
+        if not isinstance(envelope, dict) or envelope.get("subscription") != config["watch_gmail_subscription"]:
+            raise ValueError("subscription mismatch")
+        message = envelope["message"]
+        message_id = message["messageId"]
+        if not isinstance(message_id, str) or not 0 < len(message_id) <= 256:
+            raise ValueError("message identity missing")
+        payload = json.loads(base64.b64decode(message["data"], validate=True))
+        address = payload["emailAddress"]
+        if W.clean_address(address) != address:
+            raise ValueError("noncanonical mailbox")
+        history = payload["historyId"]
+        if type(history) is int and history >= 0:
+            history = str(history)
+        if not isinstance(history, str) or not re.fullmatch(r"[0-9]{1,40}", history):
+            raise ValueError("invalid history")
+    except (ValueError, TypeError, KeyError, W.WatchError):
+        return 400, {"ok": False, "error": "invalid Pub/Sub envelope"}
+    try:
+        # One mailbox source per exact registered account, never aliases or a
+        # fallback to whichever account happens to be running this iteration.
+        source_id = store.source_key("gmail", address, {"mailbox": "me"}, {})
+        source = store.get_source(source_id)
+        if not source or source["state"] != "active" or not store.consumers(source_id):
+            return 404, {"ok": False, "error": "mailbox is not watched"}
+        store.add_hint("gmail:" + source_id + ":" + history, source_id, {"history_id": history})
+    except Exception:
+        return 503, {"ok": False, "error": "durable hint write failed"}
+    return 204, {"ok": True}

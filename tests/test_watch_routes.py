@@ -1,12 +1,15 @@
 import asyncio
+import copy
 import hashlib
 import hmac
 import json
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,51 +17,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import watch
 import watch_routes
-from fake_google import FakeGoogle
-from watch_helpers import Clock, FakeRoutes, runtime, start_gmail
+from watch_helpers import Clock, make_origin
 
 
-class Conflict(RuntimeError):
-    pass
-
-
-class FakeWebhook(ModuleType):
-    def __init__(self):
-        super().__init__("fake_webhook")
-        self.store = {}
-        self.static = {}
-        self.MISSING = object()
-        self.SubscriptionMutationConflict = Conflict
-        self._MISSING_SUBSCRIPTION = self.MISSING
-
-    def _load_subscriptions(self):
-        return json.loads(json.dumps(self.store))
-
-    def _replace_subscription(self, name, route, expected):
-        current = self.store.get(name, self.MISSING)
-        if (current is self.MISSING) != (expected is self.MISSING) or (
-                current is not self.MISSING and current != expected):
-            raise Conflict("changed")
-        self.store[name] = json.loads(json.dumps(route))
-        return route
-
-    def _mutate_subscriptions(self, mutate):
-        return mutate(self.store)
-
-    def _route_url(self, name, route):
-        return "http://127.0.0.1:8644/webhooks/" + name
-
-    def _get_webhook_config(self):
-        return {"extra": {"routes": dict(self.static)}}
+def config_for(origin):
+    return {"routes": [{"origin": {key: origin.get(key) for key in watch_routes._ORIGIN_FIELDS},
+        "new_session": {"name": "gws-native", "url": "http://127.0.0.1:8644/webhooks/gws-native",
+                        "secret": "synthetic-secret-" * 3,
+                        "destination": {key: origin.get(key) for key in ("platform", "chat_id", "thread_id")}},
+        "same_session": {"bridge_name": "gws-watch-bridge-main", "url": "http://127.0.0.1:8644/webhooks/gws-watch-bridge-main",
+                         "secret": "synthetic-bridge-secret-" * 3}}]}
 
 
 class DummyResponse:
     def __init__(self, payload, status=202):
-        self.payload = payload
-        self.status = status
+        self.payload, self.status = payload, status
 
-    def read(self, limit=None):
-        return json.dumps(self.payload).encode()
+    def read(self, limit):
+        assert limit == 65536
+        return json.dumps(self.payload).encode()[:limit]
 
     def __enter__(self):
         return self
@@ -70,288 +47,254 @@ class DummyResponse:
 class RouteTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.home = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
         self.clock = Clock()
-        self.store = watch.WatchStore(self.home, clock=self.clock)
-        self.client = FakeGoogle()
-        self.routes = FakeRoutes(same_session=True)
-        self.rt = runtime(self.store, self.client, self.routes)
-        self.rt.ctx = SimpleNamespace(inject_message=lambda content, *, session_key=None: True)
-        self.fake = FakeWebhook()
-        self.module_patch = mock.patch.object(watch_routes, "_module", return_value=self.fake)
-        self.module_patch.start()
+        self.store = watch.WatchStore(self.tmp.name, clock=self.clock)
+        self.origin = make_origin()
+        self.config = config_for(self.origin)
+        self.injected = []
+        self.ctx = SimpleNamespace(inject_message=lambda content, *, session_key=None:
+                                   self.injected.append((content, session_key)) or True)
+        self.manager = watch_routes.RouteManager(self.ctx, store=self.store, config=lambda: self.config)
+        self.stub = {"watch_id": "a" * 16, "service": "gmail", "account": "person@example.com", "generation": 1}
+        self.spec = {"mode": "new_session", "instructions": "Summarize it", "skills": []}
+        self.sessions = SimpleNamespace(lookup_by_session_key=lambda key: SimpleNamespace(session_id="session-1"))
 
-    def tearDown(self):
-        self.module_patch.stop()
-        self.tmp.cleanup()
+    def create(self, mode="new_session"):
+        self.spec["mode"] = mode
+        return self.manager.create(self.stub, self.spec, self.origin)
 
-    def _manager(self, ctx=None):
-        manager = watch_routes.RouteManager(ctx or SimpleNamespace())
-        manager._check_store = lambda: None
-        return manager
+    def payload(self):
+        return {"event_type": "gws-watch", "watch_id": self.stub["watch_id"], "generation": 1, "events": []}
 
-    def _watch(self, spec=None):
-        row = {
-            "watch_id": "a" * 16, "service": "gmail", "account": "person@example.com",
-            "generation": 1,
-        }
-        spec = spec or {"instructions": "Summarize it", "skills": [], "mode": "new_session",
-                        "account": "person@example.com"}
-        origin = {"profile": "default", "platform": "discord", "chat_id": "c1",
-                  "thread_id": "t1", "principal": "u1", "session_id": "s1"}
-        return row, spec, origin
+    def bridge(self):
+        binding = self.create("same_session")
+        spec = watch.validate_common({"account": "person@example.com", "delivery_mode": "same_session",
+                                      "minutes": 60})
+        spec.update(target={"mailbox": True}, filters={}, fingerprint="fixture")
+        row = watch.create_watch(self.store, "gmail", spec, self.origin, watch_id=self.stub["watch_id"],
+                                 bridge_name=binding["name"], sources=[], baseline={})
+        self.store.add_event(row["watch_id"], "event-1", "gmail", {"x": 1})
+        event = SimpleNamespace(raw_message={"event_type": "gws-watch-bridge", "watch_id": row["watch_id"],
+                                            "event_id": "event-1", "generation": 1},
+                                source=SimpleNamespace(chat_name="webhook/gws-watch-bridge-main", platform="webhook",
+                                                       user_id="webhook:gws-watch-bridge-main", profile="default"))
+        return row, event, watch_routes.bridge_hook(self.store, self.ctx, self.manager)
+
+    def state(self):
+        return self.store.outbox(self.stub["watch_id"])[0]["state"]
 
     def test_same_session_capability_requires_callable_injection(self):
         self.assertFalse(watch_routes.same_session_capability(SimpleNamespace())["supported"])
-        self.assertFalse(watch_routes.same_session_capability(
-            SimpleNamespace(inject_message=None))["supported"])
-        capability = watch_routes.same_session_capability(
-            SimpleNamespace(inject_message=lambda content, *, session_key=None: True))
-        self.assertTrue(capability["supported"])
-        self.assertEqual(capability["keyword"], "session_key")
+        self.assertFalse(watch_routes.same_session_capability(SimpleNamespace(inject_message=None))["supported"])
+        self.ctx._gateway_injection_allowed = lambda: self.fail("private method must not be called")
+        self.assertTrue(watch_routes.same_session_capability(self.ctx)["supported"])
 
-    def test_new_session_route_is_immutable_native_contract(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        public = manager.create(row, spec, origin)
-        route = self.fake.store[public["name"]]
-        self.assertEqual(route["description"], "gws-watch owned route watch=" + row["watch_id"] + " mode=new_session")
-        self.assertEqual(route["events"], ["gws-watch"])
-        self.assertEqual(route["deliver"], "discord")
-        self.assertEqual(route["deliver_extra"], {"chat_id": "c1", "thread_id": "t1"})
-        self.assertEqual(route["profile"], "default")
-        self.assertEqual(route["signature"], "generic")
-        self.assertIs(route["deliver_only"], False)
-        self.assertIs(route["mirror_to_session"], False)
-        self.assertNotIn("cron_job", route)
-        self.assertNotIn("coalesce", route)
-        self.assertIn(row["watch_id"], route["prompt"])
-        self.assertIn("{__raw__}", route["prompt"])
+    def test_new_session_route_is_immutable_operator_contract(self):
+        before = copy.deepcopy(self.config)
+        binding = self.create()
+        self.assertEqual(self.config, before)
+        self.assertEqual(self.manager.read(binding["name"]), binding)
+        self.assertNotIn("synthetic-secret", json.dumps(binding))
+        with self.store.tx() as conn:
+            self.assertNotIn("synthetic-secret", conn.execute("SELECT metadata FROM route_bindings").fetchone()[0])
+        restarted = watch_routes.RouteManager(store=self.store, config=self.config)
+        self.assertEqual(restarted.read(binding["name"]), binding)
+        self.assertEqual(self.create(), binding)
 
     def test_same_session_route_is_bridge_without_event_prompt(self):
-        row, spec, origin = self._watch({"instructions": "secret private body", "skills": [],
-                                         "mode": "same_session", "account": "person@example.com"})
-        manager = self._manager(SimpleNamespace(inject_message=lambda content, *, session_key=None: True))
-        public = manager.create(row, spec, origin)
-        route = self.fake.store[public["name"]]
-        self.assertTrue(public["name"].startswith("gws-watch-bridge-"))
-        self.assertEqual(route["deliver"], "log")
-        self.assertIn("NO_REPLY", route["prompt"])
-        self.assertNotIn("secret private body", route["prompt"])
-        self.assertEqual(route["events"], ["gws-watch-bridge"])
+        before = copy.deepcopy(self.config)
+        binding = self.create("same_session")
+        self.assertEqual(binding["bridge_name"], "gws-watch-bridge-main")
+        self.assertEqual(self.config, before)
+        self.assertNotIn("prompt", self.config["routes"][0]["same_session"])
 
     def test_static_and_foreign_routes_are_never_shadowed(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        self.fake.static["gws-watch-" + row["watch_id"]] = {"x": 1}
-        with self.assertRaises(watch_routes.RouteError) as raised:
-            manager.create(row, spec, origin)
-        self.assertEqual(raised.exception.code, "native_route_static_conflict")
-        self.fake.static.clear()
-        self.fake.store["gws-watch-" + row["watch_id"]] = {"description": "foreign"}
-        with self.assertRaises(watch_routes.RouteError) as raised:
-            manager.create(row, spec, origin)
-        self.assertEqual(raised.exception.code, "native_route_conflict")
-        self.assertEqual(self.fake.store["gws-watch-" + row["watch_id"]], {"description": "foreign"})
+        path = Path(self.tmp.name) / "webhook_subscriptions.json"
+        path.write_text('{"foreign": true}')
+        binding = self.create()
+        self.assertFalse(self.manager.remove(binding["name"], "foreign")["removed"])
+        self.assertEqual(path.read_text(), '{"foreign": true}')
+        self.stub["generation"] = 2
+        with self.assertRaises(watch_routes.RouteError):
+            self.create()
 
-    def test_operator_disabled_route_is_preserved(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        public = manager.create(row, spec, origin)
-        self.fake.store[public["name"]]["enabled"] = False
-        result = manager.remove(public["name"], row["watch_id"])
-        self.assertEqual(result["state"], "preserved_disabled")
-        self.assertIn(public["name"], self.fake.store)
-        self.assertIn("enabled", self.fake.store[public["name"]])
-
-    def test_foreign_and_edited_routes_are_not_removed(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        public = manager.create(row, spec, origin)
-        self.fake.store[public["name"]]["description"] = "operator edited"
-        self.assertEqual(manager.remove(public["name"], row["watch_id"])["state"], "foreign")
-        self.assertIn(public["name"], self.fake.store)
-        self.fake.store[public["name"]]["description"] = (
-            "gws-watch owned route watch=" + row["watch_id"] + " mode=new_session")
-        self.fake.store[public["name"]]["prompt"] = "operator changed prompt"
-        self.assertEqual(manager.remove(public["name"], row["watch_id"])["state"], "conflict")
-        self.assertIn(public["name"], self.fake.store)
-
-    def test_corrupt_store_refuses_mutation(self):
-        path = self.home / "webhook_subscriptions.json"
+    def test_corrupt_host_store_is_never_read_or_mutated(self):
+        path = Path(self.tmp.name) / "webhook_subscriptions.json"
         path.write_text("{not-json")
-        manager = watch_routes.RouteManager(SimpleNamespace())
-        manager._store_path = lambda: path
-        with self.assertRaises(watch_routes.RouteError) as raised:
-            manager._check_store()
-        self.assertEqual(raised.exception.code, "native_route_store_corrupt")
-        path.write_text("[]")
-        with self.assertRaises(watch_routes.RouteError) as raised:
-            manager._check_store()
-        self.assertEqual(raised.exception.code, "native_route_store_corrupt")
+        binding = self.create()
+        self.manager.remove(binding["name"], self.stub["watch_id"])
+        self.assertEqual(path.read_text(), "{not-json")
 
-    def test_hmac_v2_and_stable_request_id(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        public = manager.create(row, spec, origin)
-        captured = {}
+    def test_operator_disabled_and_edited_routes_are_preserved(self):
+        for field, value in (("enabled", False), ("description", "operator edit")):
+            with self.subTest(field=field):
+                binding = self.create()
+                self.config["routes"][0]["new_session"][field] = value
+                before = copy.deepcopy(self.config)
+                self.assertTrue(self.manager.remove(binding["name"], self.stub["watch_id"])["removed"])
+                self.assertEqual(self.config, before)
+                self.config = config_for(self.origin)
 
-        def fake_urlopen(request, timeout=10):
-            captured["request"] = request
-            return DummyResponse({"status": "accepted", "delivery_id": "x"})
+    def test_operator_disabled_route_cannot_be_enabled(self):
+        self.config["routes"][0]["new_session"]["enabled"] = False
+        with self.assertRaises(watch_routes.RouteError):
+            self.create()
+        self.assertIs(self.config["routes"][0]["new_session"]["enabled"], False)
 
-        with mock.patch("watch_routes.urllib.request.urlopen", side_effect=fake_urlopen):
-            result = manager.post(public["name"], {"events": [{"id": "e1"}]}, "request-1")
-        self.assertTrue(result["ok"])
-        request = captured["request"]
-        body = request.data
-        timestamp = request.get_header("X-webhook-timestamp")
-        expected = hmac.new(manager.secret(public["name"]).encode(),
-                            timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
-        self.assertEqual(request.get_header("X-webhook-signature-v2"), expected)
-        self.assertEqual(request.get_header("X-request-id"), "request-1")
+    def test_origin_destination_profile_and_ambiguity_fail_closed(self):
+        for mutation in (lambda: self.origin.update(session_id=""),
+                         lambda: self.origin.update(profile="other"),
+                         lambda: self.config["routes"][0]["new_session"]["destination"].update(chat_id="foreign"),
+                         lambda: self.config["routes"].append(copy.deepcopy(self.config["routes"][0]))):
+            with self.subTest(mutation=mutation):
+                self.origin = make_origin()
+                self.config = config_for(self.origin)
+                mutation()
+                with self.assertRaises(watch_routes.RouteError):
+                    self.create()
 
-    def test_post_requires_an_admitted_receipt(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        public = manager.create(row, spec, origin)
-        with mock.patch("watch_routes.urllib.request.urlopen") as urlopen:
-            urlopen.return_value = DummyResponse({"status": "ignored"}, status=202)
-            unconfirmed = manager.post(public["name"], {"events": []}, "request-2")
-            urlopen.return_value = DummyResponse({"status": "duplicate"}, status=200)
-            duplicate = manager.post(public["name"], {"events": []}, "request-2")
-        self.assertFalse(unconfirmed["ok"])
-        self.assertTrue(unconfirmed["retryable"])
-        self.assertEqual(unconfirmed["error_code"], "native_route_unconfirmed")
-        self.assertTrue(duplicate["ok"])
-        self.assertTrue(duplicate["duplicate"])
+    def test_hmac_v2_stable_request_id_and_bounded_response(self):
+        binding = self.create()
+        with mock.patch("watch_routes.urllib.request.build_opener") as opener:
+            opener.return_value.open.return_value = DummyResponse({"status": "accepted"})
+            for _ in range(2):
+                self.assertTrue(self.manager.post(binding["name"], self.payload(), "request-1")["ok"])
+            requests = [call.args[0] for call in opener.return_value.open.call_args_list]
+        for request in requests:
+            timestamp = request.get_header("X-webhook-timestamp")
+            expected = hmac.new(self.manager.secret(binding["name"]).encode(),
+                                timestamp.encode() + b"." + request.data, hashlib.sha256).hexdigest()
+            self.assertEqual(request.get_header("X-webhook-signature-v2"), expected)
+            self.assertEqual(request.get_header("X-request-id"), "request-1")
+        self.assertEqual(requests[0].data, requests[1].data)
 
-    def test_post_refuses_operator_edited_route_without_sending(self):
-        row, spec, origin = self._watch()
-        manager = self._manager()
-        public = manager.create(row, spec, origin)
-        self.fake.store[public["name"]]["deliver_extra"]["chat_id"] = "attacker-chat"
-        with mock.patch("watch_routes.urllib.request.urlopen") as urlopen:
-            result = manager.post(public["name"], {"events": []}, "request-3")
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error_code"], "native_route_edited")
-        self.assertFalse(result["retryable"])
-        urlopen.assert_not_called()
+    def test_post_requires_admitted_receipt(self):
+        binding = self.create()
+        with mock.patch("watch_routes.urllib.request.build_opener") as opener:
+            opener.return_value.open.return_value = DummyResponse({"status": "ignored"})
+            self.assertTrue(self.manager.post(binding["name"], self.payload(), "r")["retryable"])
+            opener.return_value.open.return_value = DummyResponse({"status": "duplicate"}, 200)
+            self.assertTrue(self.manager.post(binding["name"], self.payload(), "r")["duplicate"])
 
-    def test_operator_disabled_route_can_be_read_but_not_enabled(self):
-        row, spec, origin = self._watch()
-        self.fake.store["gws-watch-" + row["watch_id"]] = {
-            "description": "gws-watch owned route watch=" + row["watch_id"] + " mode=new_session",
-            "enabled": False, "secret": "s", "signature": "generic",
-            "deliver": "discord", "profile": "default", "watch_digest": "stale",
-        }
-        with self.assertRaises(watch_routes.RouteError) as raised:
-            self._manager().create(row, spec, origin)
-        self.assertEqual(raised.exception.code, "native_route_disabled")
-        self.assertFalse(self.fake.store["gws-watch-" + row["watch_id"]]["enabled"])
+    def test_config_change_and_disabled_refuse_without_sending(self):
+        binding = self.create()
+        for key, value in (("url", "https://other.invalid/webhooks/gws-native"),
+                           ("secret", "changed-secret" * 4), ("enabled", False)):
+            self.config = config_for(self.origin)
+            self.config["routes"][0]["new_session"][key] = value
+            with mock.patch("watch_routes.urllib.request.build_opener") as opener:
+                result = self.manager.post(binding["name"], self.payload(), "r")
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["retryable"])
+                opener.assert_not_called()
 
-    def test_start_same_session_fails_closed_without_pin(self):
-        no_pin = runtime(self.store, self.client, self.routes)
-        no_pin.ctx = SimpleNamespace()
-        result = start_gmail(no_pin, target={"mailbox": True}, mode="same_session")
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error_code"], "same_session_host_unsupported")
-        self.assertEqual(self.store.list_watches(), [])
-        self.assertEqual(self.client.calls, [])
+    def test_redirect_is_not_followed_real_loopback(self):
+        hits = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path)
+                self.send_response(307)
+                self.send_header("Location", "/stolen")
+                self.end_headers()
+            def log_message(self, format, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.config["routes"][0]["new_session"]["url"] = f"http://127.0.0.1:{server.server_port}/webhooks/gws-native"
+            binding = self.create()
+            result = self.manager.post(binding["name"], self.payload(), "stable")
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], 307)
+            self.assertEqual(hits, ["/webhooks/gws-native"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
-    def test_bridge_hook_consumes_only_owned_route_and_verifies_session(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        started = start_gmail(self.rt, target={"thread_ids": ["T1"]}, mode="same_session")
-        self.assertTrue(started["ok"], started)
-        row = self.store.get_watch(started["watch"]["watch_id"])
-        self.assertTrue(self.store.add_event(row["watch_id"], "event-1", "gmail", {"x": 1}))
-        injected = {}
-        ctx = SimpleNamespace(inject_message=lambda content, *, session_key=None: injected.update(
-            {"content": content, "session_key": session_key}) or True)
-        sessions = SimpleNamespace(
-            lookup_by_session_key=lambda key: SimpleNamespace(session_id="session-1"))
-        hook = watch_routes.bridge_hook(self.store, ctx)
-        event = SimpleNamespace(raw_message={"event_type": "gws-watch-bridge",
-                                             "watch_id": row["watch_id"],
-                                             "event_id": "event-1", "generation": row["generation"]},
-                                source=SimpleNamespace(chat_name="webhook/" + row["bridge_name"]))
-        result = asyncio.run(hook(event, session_store=sessions))
-        self.assertEqual(result["action"], "skip")
-        self.assertEqual(injected["session_key"], "agent:default:discord:chat-1:thread-1")
-        self.assertNotIn("expected_session_id", injected)
-        self.assertEqual(self.store.outbox(row["watch_id"])[0]["state"], "scheduled")
-        # A duplicate gateway delivery must not inject twice.
-        asyncio.run(hook(event, session_store=sessions))
-        self.assertEqual(self.store.outbox(row["watch_id"])[0]["state"], "scheduled")
-        self.assertEqual(self.store.delivery_summary(row["watch_id"])["counts"],
-                         {"scheduled": 1})
+    def test_start_same_session_fails_closed_without_injection(self):
+        self.manager.ctx = SimpleNamespace()
+        with self.assertRaises(watch_routes.RouteError):
+            self.create("same_session")
 
-    def test_bridge_hook_fails_closed_without_store_or_on_session_change(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        started = start_gmail(self.rt, target={"thread_ids": ["T1"]}, mode="same_session")
-        self.assertTrue(started["ok"], started)
-        row = self.store.get_watch(started["watch"]["watch_id"])
-        ctx = SimpleNamespace(inject_message=lambda *args, **kwargs: self.fail("must not inject"))
-        hook = watch_routes.bridge_hook(self.store, ctx)
+    def test_bridge_consumes_owned_event_and_replay_only_once(self):
+        row, event, hook = self.bridge()
+        async def simultaneous():
+            return await asyncio.gather(*(hook(event, session_store=self.sessions) for _ in range(4)))
+        self.assertTrue(all(r["action"] == "skip" for r in asyncio.run(simultaneous())))
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(self.injected[0][1], self.origin["session_key"])
+        self.assertEqual(self.state(), "scheduled")
 
-        def event(event_id):
-            return SimpleNamespace(
-                raw_message={"event_type": "gws-watch-bridge", "watch_id": row["watch_id"],
-                             "event_id": event_id, "generation": row["generation"]},
-                source=SimpleNamespace(chat_name="webhook/" + row["bridge_name"]))
+    def test_bridge_without_store_or_after_reset_fails_closed(self):
+        row, event, hook = self.bridge()
+        asyncio.run(hook(event))
+        self.assertEqual(self.state(), "failed")
+        self.store.add_event(row["watch_id"], "event-2", "gmail", {})
+        event.raw_message["event_id"] = "event-2"
+        changed = SimpleNamespace(lookup_by_session_key=lambda key: SimpleNamespace(session_id="new-session"))
+        asyncio.run(hook(event, session_store=changed))
+        self.assertEqual(self.store.outbox(row["watch_id"])[1]["state"], "failed")
+        self.assertEqual(self.injected, [])
 
-        self.store.add_event(row["watch_id"], "event-1", "gmail", {"x": 1})
-        asyncio.run(hook(event("event-1")))
-        self.assertEqual(self.store.outbox(row["watch_id"])[0]["state"], "failed")
-        self.store.add_event(row["watch_id"], "event-2", "gmail", {"x": 2})
-        changed = SimpleNamespace(lookup_by_session_key=lambda key: SimpleNamespace(session_id="other"))
-        asyncio.run(hook(event("event-2"), session_store=changed))
-        rows = {entry["event_id"]: entry for entry in self.store.outbox(row["watch_id"])}
-        self.assertEqual(rows["event-2"]["state"], "failed")
-        self.assertIn("changed", rows["event-2"]["detail"])
-
-    def test_bridge_hook_allows_matched_reservation_after_expiry_only(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        started = start_gmail(self.rt, target={"thread_ids": ["T1"]}, mode="same_session")
-        self.assertTrue(started["ok"], started)
-        row = self.store.get_watch(started["watch"]["watch_id"])
-        injected = []
-        ctx = SimpleNamespace(inject_message=lambda content, *, session_key=None: injected.append(1) or True)
-        sessions = SimpleNamespace(
-            lookup_by_session_key=lambda key: SimpleNamespace(session_id="session-1"))
-        hook = watch_routes.bridge_hook(self.store, ctx)
-
-        def event(event_id):
-            return SimpleNamespace(
-                raw_message={"event_type": "gws-watch-bridge", "watch_id": row["watch_id"],
-                             "event_id": event_id, "generation": row["generation"]},
-                source=SimpleNamespace(chat_name="webhook/" + row["bridge_name"]))
-
-        self.store.add_event(row["watch_id"], "event-1", "gmail", {"x": 1})
+    def test_bridge_matched_reservation_survives_expiry_only(self):
+        row, event, hook = self.bridge()
         with self.store.tx() as conn:
-            conn.execute("UPDATE watches SET expires_at=? WHERE watch_id=?",
-                         (self.clock.now - 10, row["watch_id"]))
-        asyncio.run(hook(event("event-1"), session_store=sessions))
-        self.assertEqual(injected, [])  # active + expired is refused
-        self.assertEqual(self.store.outbox(row["watch_id"])[0]["state"], "pending")
+            conn.execute("UPDATE watches SET expires_at=? WHERE watch_id=?", (self.clock.now - 10, row["watch_id"]))
+        asyncio.run(hook(event, session_store=self.sessions))
+        self.assertEqual(self.injected, [])
         self.store.update_watch(row["watch_id"], state="matched")
-        asyncio.run(hook(event("event-1"), session_store=sessions))
-        self.assertEqual(injected, [1])  # matched reservation survives its lifetime
-        self.assertEqual(self.store.outbox(row["watch_id"])[0]["state"], "scheduled")
+        asyncio.run(hook(event, session_store=self.sessions))
+        self.assertEqual(self.state(), "scheduled")
 
-    def test_bridge_hook_skips_stale_generation_and_never_falls_through(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        started = start_gmail(self.rt, target={"thread_ids": ["T1"]}, mode="same_session")
-        self.assertTrue(started["ok"], started)
-        row = self.store.get_watch(started["watch"]["watch_id"])
-        ctx = SimpleNamespace(inject_message=lambda *args, **kwargs: self.fail("must not inject"))
-        hook = watch_routes.bridge_hook(self.store, ctx)
-        event = SimpleNamespace(raw_message={"event_type": "gws-watch-bridge",
-                                             "watch_id": row["watch_id"], "event_id": "missing",
-                                             "generation": 99},
-                                source=SimpleNamespace(chat_name="webhook/" + row["bridge_name"]))
-        result = asyncio.run(hook(event))
-        self.assertEqual(result["action"], "skip")
+    def test_bridge_forged_route_profile_generation_and_unknown_event_suppressed(self):
+        row, event, hook = self.bridge()
+        mutations = [("source", "chat_name", "webhook/foreign"), ("source", "platform", "discord"),
+                     ("source", "user_id", "attacker"), ("source", "profile", "other"),
+                     ("raw_message", "generation", 99), ("raw_message", "event_id", "unknown")]
+        for target, key, value in mutations:
+            forged = copy.deepcopy(event)
+            if target == "source":
+                setattr(forged.source, key, value)
+            else:
+                forged.raw_message[key] = value
+            self.assertEqual(asyncio.run(hook(forged, session_store=self.sessions))["action"], "skip")
+        event.raw_message = None
+        self.assertEqual(asyncio.run(hook(event))["action"], "skip")
+        self.assertEqual(self.injected, [])
+        self.assertEqual(self.state(), "pending")
+
+    def test_bridge_config_change_and_stop_are_not_injected(self):
+        row, event, hook = self.bridge()
+        self.config["routes"][0]["same_session"]["secret"] = "changed" * 8
+        self.assertEqual(asyncio.run(hook(event, session_store=self.sessions))["action"], "skip")
+        self.config = config_for(self.origin)
+        self.store.stop(row["watch_id"])
+        asyncio.run(hook(event, session_store=self.sessions))
+        self.assertEqual(self.injected, [])
+
+    def test_injection_refusal_is_uncertain_not_replayed(self):
+        row, event, hook = self.bridge()
+        self.ctx.inject_message = mock.Mock(return_value=False)
+        asyncio.run(hook(event, session_store=self.sessions))
+        asyncio.run(hook(event, session_store=self.sessions))
+        self.assertEqual(self.state(), "uncertain")
+        self.ctx.inject_message.assert_called_once()
+
+    def test_residual_reset_between_lookup_and_inject_is_not_hidden(self):
+        row, event, hook = self.bridge()
+        observed = {"sid": "session-1"}
+        def lookup(key):
+            old = SimpleNamespace(session_id=observed["sid"])
+            observed["sid"] = "replacement"
+            return old
+        self.sessions.lookup_by_session_key = lookup
+        self.ctx.inject_message = lambda content, *, session_key: self.injected.append(observed["sid"]) or True
+        asyncio.run(hook(event, session_store=self.sessions))
+        self.assertEqual(self.injected, ["replacement"])
+        self.assertEqual(self.state(), "scheduled")  # admission, never a race-free delivery claim
 
 
 if __name__ == "__main__":

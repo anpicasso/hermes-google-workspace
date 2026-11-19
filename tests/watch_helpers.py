@@ -68,6 +68,8 @@ def runtime(store, client, routes, *, config=None, origin=None, ctx=None):
         config={"watch_gmail_topic": "projects/p/topics/t",
                 "watch_gmail_subscription": "projects/p/subscriptions/s",
                 "watch_callback_url": "https://watch.example.invalid",
+                "watch_gmail_push_audience": "https://watch.example.invalid/google/gmail",
+                "watch_gmail_push_service_account": "push@p.iam.gserviceaccount.com",
                 **(config or {})},
         origin=lambda: origin,
     )

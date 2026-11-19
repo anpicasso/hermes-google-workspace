@@ -65,7 +65,10 @@ class FakeGoogle:
         if failure is not None:
             return failure
         if key[:2] == ("gmail", "users"):
-            return self._gmail(key, params or {}, body or {})
+            result = self._gmail(key, params or {}, body or {})
+            if key[2:] == ("getProfile",) and result.get("ok"):
+                result["data"]["emailAddress"] = account
+            return result
         if key[:1] == ("pubsub",) or str(args[0]).startswith("pubsub:"):
             return self._pubsub(params or {}, body or {})
         if key[:1] == ("drive",):
@@ -91,7 +94,7 @@ class FakeGoogle:
 
     def add_history(self, history_id, *message_ids):
         self.gmail["history"].append({
-            "historyId": str(history_id),
+            "id": str(history_id),
             "messagesAdded": [{"message": {"id": message_id, "threadId":
                                            self.gmail["messages"][message_id]["threadId"]}}
                               for message_id in message_ids],
@@ -121,7 +124,7 @@ class FakeGoogle:
             return {"ok": True, "data": {"id": thread_id, "messages": messages}}
         if key[2:] == ("history", "list"):
             start = int(params.get("startHistoryId") or 0)
-            records = [r for r in self.gmail["history"] if int(r["historyId"]) > start]
+            records = [r for r in self.gmail["history"] if int(r["id"]) > start]
             chunk, next_token = _page(records, params.get("pageToken"), self.gmail["page_size"])
             data = {"historyId": self.gmail["history_id"], "history": chunk}
             if next_token:

@@ -118,13 +118,9 @@ class HostDispatchTests(unittest.TestCase):
         return handle_function_call("gws_api", {"account": "a@example.com", "args": argv, **extra},
                                     task_id="t", session_id="s")
 
-    def test_logout_denial_never_reaches_handler(self):
-        from model_tools import handle_function_call
-        result = handle_function_call("gws_logout", {"account": "a@example.com", "approved": True},
-                                      task_id="t", session_id="s")
-        self.assertEqual(self.calls, [])
-        self.assertEqual(len(self.prompts), 1)
-        self.assertIn("denied", result.lower())
+    def test_private_logout_policy_is_not_owned_by_public_adapter(self):
+        hook = make_pre_tool_call_hook(lambda *_: [], typed_names=[])
+        self.assertIsNone(hook(tool_name="gws_logout", args={"account": "a@example.com"}))
 
     def test_destructive_call_is_denied_before_handler(self):
         result = self.call(["drive", "files", "delete", "--params", '{"fileId":"x"}'], approved=True)

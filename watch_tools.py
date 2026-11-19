@@ -7,9 +7,11 @@ import secrets
 if __package__:
     from . import watch as W
     from . import watch_calendar, watch_drive, watch_gmail, watch_routes
+    from .account_lifecycle import lifecycle_guard
 else:  # Direct module use by the standalone test suite.
     import watch as W  # type: ignore
     import watch_calendar, watch_drive, watch_gmail, watch_routes  # type: ignore
+    from account_lifecycle import lifecycle_guard
 
 SERVICES = {
     "gmail": watch_gmail,
@@ -50,7 +52,25 @@ def _owned(store, watch_id, service, origin):
     return watch
 
 
-def handle(service, args, runtime):
+def handle(service, args, runtime, *, session_id=None):
+    """Fence watch creation against companion logout/reauthorization.
+
+    Lock order: lifecycle -> native execution locks -> short SQLite transaction.
+    Status and stop do not acquire this barrier, so cleanup can still progress.
+    """
+    try:
+        if isinstance(args, dict) and args.get("action") == "start":
+            account = args.get("account")
+            if not isinstance(account, str):
+                raise W.WatchError("invalid_arguments", "start requires an account")
+            with lifecycle_guard(runtime.store.home / "gws-oauth", W.validate_common(args)["account"]):
+                return _handle(service, args, runtime, session_id=session_id)
+        return _handle(service, args, runtime, session_id=session_id)
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle(service, args, runtime, *, session_id=None):
     """Dispatch one tool call. ``runtime`` is built by the plugin registration."""
     module = SERVICES[service]
     if not isinstance(args, dict):
@@ -64,7 +84,7 @@ def handle(service, args, runtime):
         return {"ok": False, "error_code": "invalid_arguments",
                 "error": f"unknown or action-inappropriate fields: {', '.join(sorted(unknown))}"}
     try:
-        origin = runtime.origin()
+        origin = runtime.origin(session_id) if session_id is not None else runtime.origin()
         store = runtime.store
         store.expire_due()
         if action == "start":
@@ -127,7 +147,7 @@ def handle(service, args, runtime):
             return {"ok": True, "action": "stop", "watch": W.watch_status(store, stopped),
                     "local_revoked": True,
                     "remote_cleanup": "pending",
-                    "note": "Stop removes the owned route and may cancel pending replies; already sent output cannot be undone."}
+                    "note": "Stop removes the local watch binding; operator routes are preserved. Already admitted or sent output cannot be undone."}
         watch_id = args.get("watch_id")
         if watch_id is not None:
             if not isinstance(watch_id, str) or not watch_id:
@@ -143,5 +163,5 @@ def handle(service, args, runtime):
         return _error(exc)
 
 
-def bridge_callback(store, ctx):
-    return watch_routes.bridge_hook(store, ctx)
+def bridge_callback(store, ctx, routes=None, *, profile="default"):
+    return watch_routes.bridge_hook(store, ctx, routes, profile=profile)

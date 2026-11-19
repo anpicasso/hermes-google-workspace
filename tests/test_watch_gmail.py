@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import watch
 import watch_gmail
-from fake_google import FakeGoogle, pubsub_message
-from watch_helpers import Clock, FakeRoutes, runtime, start_gmail
+from test_watch_pubsub import FakeGoogle, runtime
+from watch_helpers import Clock, FakeRoutes, start_gmail
 
 
 class GmailTests(unittest.TestCase):
@@ -119,77 +119,61 @@ class GmailTests(unittest.TestCase):
         watch_gmail.drain(self.client, self.store, replayed, [watch_row])
         self.assertEqual(len(self.store.outbox(watch_row["watch_id"])), 3)
 
-    def test_pubsub_pull_persists_hints_and_never_acks_unroutable_accounts(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        watch_row, _ = self._watch(target={"mailbox": True})
-        source = self._source(watch_row)
-        self.client.gmail["pubsub"] = [[
-            pubsub_message("person@example.com", "150"),
-            pubsub_message("other@example.com", "151"),
-        ]]
-        result = watch_gmail.pubsub_pull(self.client, self.store, source, self.rt.config)
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["hints"], 1)
-        self.assertEqual(result["unrouted"], 1)
-        self.assertEqual(len(self.store.pending_hints(source["source_id"])), 1)
-        ack = self.client.calls[-1]
-        self.assertEqual(ack["args"][-1], "acknowledge")
-        # The foreign notification belongs to another consumer; do not destroy it.
-        self.assertEqual(ack["body"]["ackIds"], ["ack-150"])
-
-    def test_pubsub_accepts_live_numeric_history_id(self):
-        import base64
-        row, _ = self._watch(target={"mailbox": True})
+    def test_all_change_types_paginate_restart_and_replay(self):
+        row, _ = self._watch(filters={"change_types": list(watch_gmail.CHANGE_TYPES), "include_sent": True})
         source = self._source(row)
-        # The real Gmail notification encodes historyId as a JSON integer.
-        for value, expected in ((150, 1), (True, 0), (-1, 0), (1.5, 0)):
-            message = pubsub_message("person@example.com", "150")
-            message["message"]["data"] = base64.b64encode(json.dumps({
-                "emailAddress": "person@example.com", "historyId": value}).encode()).decode()
-            self.client.gmail["pubsub"] = [[message]]
-            result = watch_gmail.pubsub_pull(self.client, self.store, source, self.rt.config)
-            self.assertEqual(result["hints"], expected)
-        self.assertEqual(len(self.store.pending_hints(source["source_id"])), 1)
+        self.client.add_message("old", "T1", internal_date="1600000000000")
+        self.client.add_message("new", "T1", internal_date="1800000000000")
+        for index, (kind, field) in enumerate(watch_gmail.CHANGE_TYPES.items(), 101):
+            message = "new" if kind == "messageAdded" else "old"
+            self.client.gmail["history"].append({"historyId": str(index), "id": str(index),
+                field: [{"message": {"id": message, "threadId": "T1"}, "labelIds": ["STARRED"]}]})
+        self.client.gmail.update(history_id="104", page_size=1)
+        for _ in range(3):
+            result = watch_gmail.drain(self.client, self.store, self._source(row), [row], max_pages=1)
+            self.assertTrue(result["staged"])
+            self.assertEqual(self._source(row)["cursor"], "100")
+            self.store = watch.WatchStore(self.home, clock=self.clock)
+        result = watch_gmail.drain(self.client, self.store, self._source(row), [row], max_pages=1)
+        self.assertEqual(result["cursor"], "104")
+        self.assertEqual(len(self.store.outbox(row["watch_id"])), 4)
+        watch_gmail.drain(self.client, self.store, source, [row])
+        self.assertEqual(len(self.store.outbox(row["watch_id"])), 4)
+        for call in self.client.calls:
+            if call["args"][-2:] == ["history", "list"]:
+                self.assertNotIn("historyTypes", call["params"])
 
-    def test_pubsub_multiplexes_accounts_sharing_one_subscription(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        first, _ = self._watch(target={"mailbox": True})
-        second, _ = self._watch(account="other@example.com", target={"mailbox": True})
-        first_source, second_source = self._source(first), self._source(second)
-        self.client.gmail["pubsub"] = [[
-            pubsub_message("person@example.com", "150"),
-            pubsub_message("other@example.com", "151"),
-        ]]
-        result = watch_gmail.pubsub_pull(self.client, self.store, first_source, self.rt.config)
-        self.assertTrue(result["ok"], result)
-        self.assertEqual(result["hints"], 2)
-        self.assertEqual(result["unrouted"], 0)
-        self.assertEqual(len(self.store.pending_hints(first_source["source_id"])), 1)
-        self.assertEqual(len(self.store.pending_hints(second_source["source_id"])), 1)
-        self.assertEqual(self.client.calls[-1]["body"]["ackIds"], ["ack-150", "ack-151"])
+    def test_deletions_fail_closed_for_missing_metadata(self):
+        event = {"change_type": "messageDeleted", "message_id": "gone", "thread_id": "T1",
+                 "metadata_missing": True, "history_id": "101"}
+        for extra in ({}, {"from_addresses": ["alice@example.com"]},
+                      {"subject_contains": ["invoice"]}, {"label_ids": ["INBOX"]}):
+            row, _ = self._watch(filters={"change_types": ["messageDeleted"], **extra})
+            self.assertFalse(watch_gmail.match(row, event, self.client))
+        row, _ = self._watch(filters={"change_types": ["messageDeleted"], "include_sent": True})
+        self.assertTrue(watch_gmail.match(row, event, self.client))
+        self.assertFalse(watch_gmail.match(row, dict(event, history_id="100"), self.client))
 
-    def test_pubsub_pull_uses_documented_request_shape(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        watch_row, _ = self._watch(target={"mailbox": True})
-        source = self._source(watch_row)
-        watch_gmail.pubsub_pull(self.client, self.store, source, self.rt.config)
-        pull = [call for call in self.client.calls if call["args"][-1] == "pull"][-1]
-        self.assertEqual(pull["args"][0], "pubsub:v1")
-        self.assertEqual(pull["params"], {"subscription": "projects/p/subscriptions/s"})
-        self.assertEqual(pull["body"]["maxMessages"], 20)
-        self.assertIs(pull["body"]["returnImmediately"], True)
+    def test_label_cycles_and_vanished_message_are_not_collapsed(self):
+        row, _ = self._watch(filters={"change_types": ["labelAdded", "labelRemoved"], "include_sent": True})
+        for index, field in ((101, "labelsAdded"), (102, "labelsRemoved"), (103, "labelsAdded")):
+            self.client.gmail["history"].append({"historyId": str(index), "id": str(index),
+                field: [{"message": {"id": "gone", "threadId": "T1"}, "labelIds": ["STARRED"]}]})
+        self.client.gmail["history_id"] = "103"
+        source = self._source(row)
+        self.assertTrue(watch_gmail.drain(self.client, self.store, source, [row])["ok"])
+        events = [json.loads(r["payload_json"]) for r in self.store.outbox(row["watch_id"])]
+        self.assertEqual(len(events), 3)
+        self.assertTrue(all(e["metadata_missing"] for e in events))
+        watch_gmail.drain(self.client, self.store, source, [row])
+        self.assertEqual(len(self.store.outbox(row["watch_id"])), 3)
 
-    def test_pubsub_validation_failure_is_not_retried(self):
-        self.client.add_message("root", "T1", internal_date="1600000000000")
-        watch_row, _ = self._watch(target={"mailbox": True})
-        source = self._source(watch_row)
-        self.client.fail(("pubsub:v1", "projects", "subscriptions", "pull"),
-                         400, "invalid_arguments", False)
-        result = watch_gmail.pubsub_pull(self.client, self.store, source, self.rt.config)
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error_code"], "invalid_arguments")
-        self.assertFalse(result["retryable"])
-        self.assertEqual(self.store.pending_hints(source["source_id"]), [])
+    def test_default_types_and_invalid_types(self):
+        row, _ = self._watch()
+        self.assertEqual(json.loads(row["filters_json"])["change_types"], ["messageAdded"])
+        self.assertFalse(watch_gmail.match(row, {"change_type": "labelAdded"}))
+        for types in ([], ["unknown"], "messageAdded"):
+            self.assertFalse(start_gmail(self.rt, filters={"change_types": types})["ok"])
 
     def test_transient_message_fetch_does_not_advance_cursor(self):
         self.client.add_message("root", "T1", internal_date="1600000000000")
