@@ -10,7 +10,7 @@ This still differs from rule 11's Hermes-managed `oauth:` declaration, `hermes a
 
 ## Public host surfaces and operator responsibility
 
-The adapter uses public tool/command/hook registration, the approval directive and `ctx.inject_message`. `/gws-bind` obtains origin from public command-dispatch context. Routing does not import private webhook helpers, discover native subscription files, or create/edit/delete Hermes routes. Operators provision routes through public Hermes commands and configure exact route attestations; see [the route contract](routes-contract.md).
+The adapter uses public tool/hook registration, the approval directive and `ctx.inject_message`. Automatic watch origin capture deliberately uses two internal host APIs: `gateway.session_context._bound_session_value` and `agent.delegation_context.is_delegated_child_process_context`. They avoid global-environment fallback and inherited parent routes; this is a compatibility/policy exception requiring maintainer review, not a claim of public-API-only compliance. Routing does not import private webhook helpers, discover native subscription files, or create/edit/delete Hermes routes. Operators provision routes through public Hermes commands and configure exact route attestations; see [the route contract](routes-contract.md).
 
 The attestation is not remote readback: direct receiver edits are undetectable if the plugin configuration is unchanged. Stop watches before changing receiver destinations, prompts, skills, signature mode or secrets, and verify the receiver through its public CLI. Config digest checks prevent silent retargeting through changed plugin configuration, not malicious operator behavior.
 
@@ -19,7 +19,7 @@ The attestation is not remote readback: direct receiver edits are undetectable i
 - One profile represents one trusted operator. Authorized sessions can use all its accounts; account slots are not tenants or isolation from other processes under the same OS user.
 - Mutations, sends/shares, uploads, local file input/output and unknown native operations request Hermes approval. The host's approval mode and grants still apply. Model-supplied approval fields cannot authorize calls.
 - Watch start authorizes bounded background subscription operations, renewal, reads and cleanup. The worker does not ask on each renewal.
-- `/gws-bind` captures the command sender, not each subsequent tool caller. Shared multi-user physical sessions lack per-turn actor authorization. Prefer sender-isolated sessions or trusted conversations.
+- Watch calls require the current bound actor, physical session and profile. Mixed/cleared actors, delegated children and missing context fail closed. This does not turn a shared operator profile into isolated tenants or defend against another trusted plugin forging host context.
 - Same-session delivery retains a concurrent `/new` race: checking the physical session and admitting injection are not atomic. HTTP admission or injection acceptance is not execution or external delivery confirmation; no exactly-once guarantee is claimed.
 
 ## Operational and privacy disclosures

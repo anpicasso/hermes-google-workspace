@@ -19,6 +19,6 @@ Installation does not start a worker, provision cloud resources, or create deliv
 - Operator-provisioned native Hermes webhook routes and exact route attestations.
 - A supervised worker with a loopback listener and public HTTPS forwarding of only its Google callback paths.
 - Gmail authenticated Pub/Sub PUSH with topic publisher IAM, a dedicated service-account identity and exact OIDC audience; Drive/Calendar channel callbacks.
-- `/gws-bind` in the intended conversation before starting a watch. Bind again after a new session, plugin reload/restart or binding expiry.
+- Start watches through the agent in the intended conversation. Runtime origin is captured automatically; no manual bind command is required. Unbound calls and delegated children are refused.
 
 Same-session delivery requires explicit injection permission. Session lookup and injection are not atomic: a concurrent `/new` can still race. HTTP admission or injection acceptance is not proof of delivery. See [compatibility and limitations](docs/compatibility.md) and [catalog notes](docs/catalog-policy.md).

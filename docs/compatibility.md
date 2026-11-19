@@ -8,9 +8,10 @@ The repository tests/CI pin Hermes commit `f7e2898aaefc8f967dbf7345e3999a65672fe
 
 [The workflow](../.github/workflows/ci.yml) is the reproducible environment specification: Python 3.14 with the pinned Hermes lockfile, PyYAML 6.0.3, aiohttp 3.14.5, `google-auth[requests]>=2.40,<3`, and a checksum-verified native CLI. It runs unittest discovery with isolated homes and no inherited Google credentials, rejects skips, then runs plugin validation and Doctor. Do not duplicate that setup with an unpinned host and call it the same baseline.
 
-## Required public host surfaces
+## Required host surfaces
 
-- Tool, hook and command registration; trusted command-dispatch `source`, `session_id`, `session_key` and `platform` context for `/gws-bind`.
+- Public tool/hook registration and host-dispatched physical `session_id`.
+- Internal compatibility adapter: `gateway.session_context._bound_session_value` and `agent.delegation_context.is_delegated_child_process_context`. Bound ID/profile/actor/route fields must be available during tool execution; missing support refuses watches without environment fallback.
 - `pre_tool_call` approval directives and the actual host approval dispatcher.
 - Native generic-HMAC webhook ingress provisioned by the operator.
 - For same-session delivery: `pre_gateway_dispatch` with a usable session store and public `ctx.inject_message(session_key=...)`, plus explicit `allow_gateway_injection` consent.
@@ -29,4 +30,4 @@ hermes plugins validate . --json
 hermes plugins doctor . --ci
 ```
 
-Inspect skips and failures rather than quoting historical passing counts. Tests exercise simulated Google transport, synthetic identities, loopback HTTP, native dry-run behavior and selected real public host entry points. They do not establish real Google consent, live authenticated Pub/Sub push, remote receiver configuration, agent execution or external message delivery. Those require separate operator-controlled checks before release/deployment. Revalidate public command, approval, webhook and injection behavior when upgrading Hermes or `gws`.
+Inspect skips and failures rather than quoting historical passing counts. Tests exercise simulated Google transport, synthetic identities, loopback HTTP, native dry-run behavior and selected real host entry points. They do not establish real Google consent, live authenticated Pub/Sub push, remote receiver configuration, agent execution or external message delivery. Those require separate operator-controlled checks before release/deployment. Revalidate bound context, delegation, approval, webhook and injection behavior when upgrading Hermes or `gws`.

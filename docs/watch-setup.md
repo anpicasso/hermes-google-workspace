@@ -18,6 +18,16 @@ The worker uses the official `google.oauth2.id_token.verify_oauth2_token` verifi
 
 Forward only `/google/gmail`, `/google/drive` and `/google/calendar` from your TLS proxy to the worker's loopback listener (`127.0.0.1:8765` by default). Drive/Calendar callbacks use channel bearer tokens and stored channel/resource identity, not Gmail OIDC. The worker never fetches callback-supplied URLs. Keep controls and unrelated gateway endpoints private.
 
+### Public HTTPS ingress options
+
+Keep the worker bound to loopback and expose only the three Google callback paths:
+
+- **Tailscale Funnel:** public HTTPS ingress suitable for Google callbacks. Tailscale Serve alone is tailnet-private; Google cannot reach it.
+- **Cloudflare Tunnel:** use a stable public hostname targeting the loopback worker. Do not require interactive Cloudflare Access login on callback paths; retain the worker's OIDC/channel authentication. Preserve the Authorization header and request body.
+- **Public reverse proxy:** Caddy or Nginx on public HTTPS with a valid certificate, forwarding only the callback paths to loopback. Expose the TLS proxy, not the worker or Hermes administration ports.
+
+Use a stable URL throughout the subscription lifetime, set the exact Gmail OIDC audience, and configure request-size/rate limits at ingress. A tunnel does not replace notification authentication. Obtain operator approval before changing public exposure, DNS, IAM or cloud subscriptions. Native Hermes delivery URLs are a separate hop and need not be exposed alongside Google ingress.
+
 ## Provision Hermes delivery routes
 
 Use the public `hermes webhook subscribe` CLI; consult that host's `--help` for its flags. The plugin never creates, changes, disables or deletes a Hermes route and never reads its private subscription store. Configure each route separately, then attest its exact settings in `watch_routes` below. The full [route contract](routes-contract.md) is authoritative.
@@ -97,9 +107,9 @@ Status reports lock/heartbeat, source errors/retries and cleanup, not Google del
 
 Subscription failures use durable backoff (initial retry 10 seconds, cap 900). `run --subscription-backoff-max SECONDS --retention-days DAYS` adjusts worker behavior. Fully cleaned terminal records are pruned hourly after the retention window (default 7 days); uncertain/in-flight evidence and pending cleanup are retained. Reconciliation defaults to 300 seconds and drains durable cursors independently of push hints; it is not full-resource polling.
 
-## Bind and start a watch
+## Start a watch through the agent
 
-Establish a conversation, then run `/gws-bind` there. This public command accepts no destination arguments; it binds trusted command sender, profile, route and physical session. Run it again after `/new`, plugin reload/restart or binding expiry. Unbound tool calls and delegated children with different physical IDs fail closed. A command issued before the host creates a physical session cannot bind.
+Ask the agent to start the watch in the intended conversation. The tool snapshots its actual runtime session, profile, actor and route automatically; there is no manual bind command. Model destination arguments, missing bound context, mixed/cleared actors and delegated children (including children with rebound physical IDs) fail closed. Operator route provisioning is still required. See the [internal adapter disclosure](catalog-policy.md).
 
 ```json
 {"tool":"gws_gmail_watch","arguments":{"action":"start","account":"user@example.com","target":{"thread_ids":["THREAD_ID"]},"filters":{"from_addresses":["alice@example.com"],"change_types":["messageAdded"]},"delivery_mode":"new_session","minutes":120,"stop_after_match":true}}
@@ -120,7 +130,7 @@ Either boolean value of Gmail `has_attachment` requires verifiable `gmail.readon
 ## Honest delivery and coverage limits
 
 - Same-session lookup and injection are not atomic. A concurrent `/new` can replace the physical session between them. Acceptance means scheduled/admitted, not delivered. Ambiguous claims are not blindly replayed.
-- `/gws-bind` records the actor who issued it, not each subsequent caller in a shared physical session. Use sender-isolated sessions or trusted conversations; this is not per-turn multi-user authorization.
+- Current actor context is required; mixed/cleared actors refuse. Use trusted conversations or sender-isolated sessions: account slots within one operator profile are not separate tenants.
 - Native HTTP accepted/duplicate receipts prove admission, not agent execution or external delivery. Operator configuration is an attestation, not remote receiver readback. No exactly-once guarantee.
 - Push may be lost/delayed; upstream changes can coalesce. Gmail history 404 resynchronizes with an unrecoverable gap, Calendar 410 rebuilds its snapshot with a gap, and rejected Drive cursors require explicit resync/restart. A full outbox pauses cursor advancement. A reserved one-shot event survives its collection deadline until forwarding or explicit stop.
 - Offline/synthetic transport and public-host tests are not live OAuth, real Pub/Sub push or native-session end-to-end evidence. See [compatibility](compatibility.md) for the pinned baseline and release checks.

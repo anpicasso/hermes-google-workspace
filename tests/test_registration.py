@@ -1,5 +1,5 @@
 """Public plugin loads independently; account lifecycle and origins fail closed."""
-import asyncio
+import contextvars
 import importlib.util
 import json
 import sys
@@ -22,12 +22,13 @@ class RegistrationTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
         self.active_home = self.home
-        self.tools, self.commands, self.hooks = {}, {}, {}
+        self.tools, self.commands, self.hooks, self.skills = {}, {}, {}, {}
         self.home_patch = patch("hermes_constants.get_hermes_home", side_effect=lambda: self.active_home)
         self.home_patch.start()
         self.addCleanup(self.home_patch.stop)
         self.ctx = SimpleNamespace(profile_name="default",
             get_config=lambda key, default=None: default,
+            register_skill=lambda name, path: self.skills.setdefault(name, path),
             register_tool=lambda **kw: self.tools.setdefault(kw["name"], kw),
             register_hook=lambda name, cb: self.hooks.setdefault(name, cb),
             register_command=lambda name, cb, **kw: self.commands.setdefault(name, cb),
@@ -42,7 +43,9 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(set(self.tools), {"gws_accounts", "gws_api", "gws_gmail_watch",
             "gws_drive_watch", "gws_calendar_watch"} | set(SCHEMAS))
         self.assertNotIn("gws_public_test.oauth", sys.modules)
-        self.assertEqual(set(self.commands), {"gws-bind"})
+        self.assertEqual(self.commands, {})
+        self.assertEqual(set(self.skills), {"workspace"})
+        self.assertTrue(self.skills["workspace"].is_file())
         self.assertFalse((self.home / "gws-oauth").exists())
         self.assertEqual(self.call("gws_accounts", {}), {"ok": True, "accounts": []})
 
@@ -82,7 +85,6 @@ class RegistrationTests(unittest.TestCase):
         self.active_home = self.home / "other-profile"
         for name in self.tools:
             self.assertEqual(self.call(name, {})["error_code"], "profile_mismatch", name)
-        self.assertIn("refused", asyncio.run(self.commands["gws-bind"]()))
 
     def test_watch_does_not_borrow_environment_origin(self):
         import os
@@ -94,14 +96,15 @@ class RegistrationTests(unittest.TestCase):
 
     def test_bound_origin_uses_physical_id(self):
         from gws_public_test import watch_tools
-        source = SimpleNamespace(platform="discord", user_id="u", chat_id="c", thread_id="t")
-        result = asyncio.run(self.commands["gws-bind"]("", source=source, platform="discord",
-                            session_id="physical", session_key="logical"))
-        self.assertIn("bound", result)
+        from gateway.session_context import set_session_vars
+        context = contextvars.Context()
+        context.run(set_session_vars, platform="discord", user_id="u", actor_id="u",
+                    chat_id="c", thread_id="t", profile="default", cron_session="",
+                    session_id="physical", session_key="logical")
         with patch.object(watch_tools, "handle", side_effect=lambda service, args, rt, **kw: rt.origin(kw["session_id"])):
-            origin = self.call("gws_gmail_watch", {"action": "status"}, session_id="physical")
+            origin = context.run(self.call, "gws_gmail_watch", {"action": "status"}, session_id="physical")
             self.assertEqual(origin["session_key"], "logical")
-            self.assertFalse(self.call("gws_gmail_watch", {"action": "status"}, session_id="child")["ok"])
+            self.assertFalse(context.run(self.call, "gws_gmail_watch", {"action": "status"}, session_id="child")["ok"])
 
 
 if __name__ == "__main__":

@@ -52,4 +52,4 @@ Curated approval previews always show recipients, attendees, share targets and p
 
 The operator selects native login scopes; the public plugin does not choose a login preset or widen grants. The OAuth client, consent screen, Google policy and actual granted scopes govern access. `gws_accounts(check_health=true)` reports sanitized granted scopes, never credentials.
 
-Watch calls require `/gws-bind` in the intended conversation and an exact operator-provisioned route. Binding is a public command, not a model tool or an automatic route creator. Rebind after `/new`, reload or expiry. See [watch setup](watch-setup.md) for `change_types`, push authentication and delivery limits.
+Watch calls capture the current runtime origin automatically and require an exact operator-provisioned route. No manual bind command is required; model-supplied destinations, unbound contexts and delegated children are refused. Automatic origin capture does not create operator routes. See [watch setup](watch-setup.md) for `change_types`, push authentication and delivery limits.

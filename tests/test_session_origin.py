@@ -1,6 +1,5 @@
-import asyncio
-import functools
-import importlib.util
+"""Exercise the real host ContextVars with synthetic routes, not live delivery."""
+import contextvars
 import os
 import sys
 import unittest
@@ -10,91 +9,101 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+HOST = Path(os.environ.get("HERMES_AGENT_SRC", Path.home() / ".hermes/hermes-agent"))
+sys.path.insert(0, str(HOST))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from session_origin import OriginBindings
+from gateway import session_context as S
+from agent.delegation_context import delegated_child_context
+from session_origin import current_origin
 from watch import WatchError
 
 
 class OriginTests(unittest.TestCase):
     def setUp(self):
-        self.now = 100
-        self.bindings = OriginBindings(ttl=10, max_entries=4, clock=lambda: self.now)
-        self.context: dict[str, Any] = dict(source=SimpleNamespace(user_id="actor", platform="discord", chat_id="chat",
-                                                  thread_id="thread", profile="default"),
-                            session_id="physical", session_key="route", platform="discord", profile="default")
+        self.context = contextvars.Context()
+        self.fields: dict[str, Any] = dict(platform="discord", chat_id="chat", thread_id="thread",
+                           user_id="actor", actor_id="actor", profile="default",
+                           session_id="physical", session_key="route", cron_session="")
+        self.context.run(S.set_session_vars, **self.fields)
 
-    def bind(self, **kwargs):
-        return asyncio.run(self.bindings.bind("", **{**self.context, **kwargs}))
+    def origin(self, sid="physical", profile="default"):
+        return self.context.run(current_origin, sid, profile)
 
-    def test_real_public_command_invocation_seam(self):
-        host = Path(os.environ.get("HERMES_AGENT_SRC", Path.home() / ".hermes" / "hermes-agent"))
-        path = host / "hermes_cli/plugin_command_dispatch.py"
-        self.assertTrue(path.is_file(), "Real host command dispatch source is required")
-        spec = importlib.util.spec_from_file_location("host_command_dispatch", path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        handler = functools.partial(self.bindings.bind, profile="default")
-        context = {key: value for key, value in self.context.items() if key != "profile"}
-        result = asyncio.run(module.invoke_plugin_command(handler, "", **context))
-        self.assertIn("origin bound", result)
-        origin = self.bindings.origin("physical", "default")
+    def test_automatic_snapshot_without_command(self):
+        origin = self.origin()
         self.assertEqual(origin["principal"], "actor")
         self.assertEqual(origin["session_key"], "route")
+        self.assertEqual(origin["session_id"], "physical")
+        self.assertEqual(origin["thread_id"], "thread")
+        origin["chat_id"] = "tampered"
+        self.assertEqual(self.origin()["chat_id"], "chat")
 
-    def test_unbound_child_empty_and_profile_refused_despite_global_fallback(self):
-        self.bind()
-        with mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "physical", "HERMES_SESSION_USER_ID": "actor",
-                                         "HERMES_SESSION_KEY": "route", "USER": "actor"}):
-            for sid, profile in (("", "default"), ("child-rebound-id", "default"),
-                                 ("physical", "other"), ("after-new", "default")):
+    def test_unbound_context_never_borrows_global_environment(self):
+        env = {"HERMES_SESSION_" + k: v for k, v in {
+            "ID": "physical", "KEY": "route", "PROFILE": "default",
+            "PLATFORM": "discord", "CHAT_ID": "chat", "ACTOR_ID": "actor"}.items()}
+        with mock.patch.dict(os.environ, env):
+            with self.assertRaises(WatchError):
+                contextvars.Context().run(current_origin, "physical", "default")
+
+    def test_id_profile_and_required_fields_fail_closed(self):
+        for sid, profile in (("", "default"), ("child", "default"), ("physical", "other")):
+            with self.assertRaises(WatchError):
+                self.origin(sid, profile)
+        for field in ("actor_id", "chat_id", "session_key", "profile"):
+            self.context.run(S.set_session_vars, **{**self.fields, field: ""})
+            with self.assertRaises(WatchError):
+                self.origin()
+
+    def test_child_inherited_route_refused_even_after_id_rebind(self):
+        def child(sid):
+            with delegated_child_context(sid):
+                self.assertEqual(S.get_session_env("HERMES_SESSION_ID"), sid)
                 with self.assertRaises(WatchError):
-                    self.bindings.origin(sid, profile)
+                    current_origin(sid, "default")
+        for sid in ("physical", "child-rebound"):
+            self.context.run(child, sid)
+        self.assertEqual(self.origin()["session_id"], "physical")
 
-    def test_no_actor_fallback_and_no_model_destination(self):
-        self.context["source"].user_id = None
-        with mock.patch.dict(os.environ, {"HERMES_SESSION_USER_ID": "victim", "USER": "victim"}):
-            self.assertIn("refused", self.bind())
-        self.context["source"].user_id = "actor"
-        self.assertIn("Usage", asyncio.run(self.bindings.bind("chat=attacker", **self.context)))
+    def test_delegated_process_marker_refused(self):
+        with mock.patch.dict(os.environ, {"HERMES_DELEGATED_CHILD_CONTEXT": "1"}):
+            with self.assertRaises(WatchError):
+                self.origin()
+
+    def test_actor_clearing_never_falls_back_to_route_user(self):
+        event = SimpleNamespace(user_id="actor")
+        self.context.run(S.set_session_vars, **self.fields, turn_event=event)
+        self.assertEqual(self.origin()["principal"], "actor")
+        event.user_id = ""
         with self.assertRaises(WatchError):
-            self.bindings.origin("physical", "default")
+            self.origin()
 
-    def test_conflicting_actor_does_not_rebind_physical_session(self):
-        self.bind()
-        self.context["source"].user_id = "other"
-        self.assertIn("refused", self.bind())
-        self.assertEqual(self.bindings.origin("physical", "default")["principal"], "actor")
-
-    def test_expiry_cleanup_capacity_and_restart(self):
-        for i in range(4):
-            self.assertIn("origin bound", self.bind(session_id=str(i)))
-        self.assertIn("capacity", self.bind(session_id="overflow"))
-        self.now += 11
-        self.assertIn("origin bound", self.bind(session_id="fresh"))
-        self.assertEqual(len(self.bindings._bindings), 1)
+    def test_nonconversation_surfaces_and_cron_refused(self):
+        for platform in ("webhook", "api_server", "cron", "cli", "kanban"):
+            self.context.run(S.set_session_vars, **{**self.fields, "platform": platform})
+            with self.assertRaises(WatchError):
+                self.origin()
+        self.context.run(S.set_session_vars, **{**self.fields, "cron_session": "1"})
         with self.assertRaises(WatchError):
-            OriginBindings().origin("fresh", "default")
+            self.origin()
 
-    def test_concurrent_origins_and_defensive_copy(self):
+    def test_concurrent_contexts_do_not_mix_routes(self):
         def run(i):
-            source = SimpleNamespace(user_id=f"u{i}", platform="discord", chat_id=f"c{i}")
-            self.bind(session_id=f"s{i}", session_key=f"k{i}", source=source)
-            return self.bindings.origin(f"s{i}", "default")
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            origins = list(executor.map(run, range(4)))
-        for i, origin in enumerate(origins):
-            self.assertEqual(origin["principal"], f"u{i}")
-            self.assertEqual(origin["chat_id"], f"c{i}")
-        origins[0]["chat_id"] = "tampered"
-        self.assertEqual(self.bindings.origin("s0", "default")["chat_id"], "c0")
+            def resolve():
+                S.set_session_vars(**{**self.fields, "actor_id": f"u{i}", "chat_id": f"c{i}",
+                                      "session_id": f"s{i}", "session_key": f"k{i}"})
+                return current_origin(f"s{i}", "default")
+            return contextvars.Context().run(resolve)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(run, range(4)))
+        for i, origin in enumerate(results):
+            self.assertEqual((origin["principal"], origin["chat_id"], origin["session_key"]),
+                             (f"u{i}", f"c{i}", f"k{i}"))
 
-    def test_source_platform_profile_and_empty_session_checks(self):
-        self.assertIn("refused", self.bind(session_id=""))
-        self.assertIn("refused", self.bind(platform="telegram"))
-        self.assertIn("refused", self.bind(profile="other"))
-        self.context["source"].platform = "webhook"
-        self.assertIn("refused", self.bind(platform="webhook"))
+    def test_missing_host_adapter_refused(self):
+        with mock.patch.dict(sys.modules, {"gateway.session_context": None}):
+            with self.assertRaises(WatchError):
+                self.origin()
 
 
 if __name__ == "__main__":

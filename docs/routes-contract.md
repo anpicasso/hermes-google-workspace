@@ -2,34 +2,23 @@
 
 ## Parent integration API
 
-`OriginBindings(ttl=3600, max_entries=1024)` lives in `session_origin.py`. Create one
-instance per loaded plugin profile. Register an async `/gws-bind` command with a
-wrapper (or `functools.partial`) fixing `profile` to the plugin instance's profile:
+`current_origin(session_id, profile)` snapshots the current tool call's bound
+runtime context. The wrapper supplies the host-dispatched physical `session_id`
+and the loaded plugin profile, never model arguments. It requires matching bound
+ID/profile, a non-empty current actor, route key, platform and chat. Optional thread,
+scope and parent-chat metadata is copied without message content or credentials.
 
-```python
-async def bind(raw_args, *, source=None, session_id="", session_key="", platform=""):
-    return await bindings.bind(raw_args, source=source, session_id=session_id,
-                               session_key=session_key, platform=platform, profile=profile)
-ctx.register_command("gws-bind", bind, description="Bind GWS watches to this conversation")
-```
+No manual bind command, TTL map or process-global environment fallback exists.
+Each call gets a fresh snapshot, including after `/new` or plugin reload. Delegated
+children are refused before resolving origin, even if a child inherits its parent's
+route and rebinds its own physical ID. Webhook, scheduled and non-conversational
+surfaces are refused. Mixed/cleared actor turns never fall back to route ownership.
 
-Only the public command dispatcher may supply this context. Do not register bind
-as a model tool. The handler accepts no destination arguments. Actor identity is
-`source.user_id`, never USER or a session-environment fallback. The binding stores
-only whitelisted source fields: profile, principal/user_id, platform, chat_id,
-thread_id, session_key, physical session_id, chat_type, scope_id, parent_chat_id.
-No message body, credentials, arbitrary source metadata, or global environment is
-stored. Bindings are an in-memory, locked, bounded TTL map; expired entries are
-cleaned on bind/read. Capacity exhaustion refuses rather than evicting active
-bindings. Conflicting reuse of a physical ID refuses.
-
-A tool wrapper must call `bindings.origin(kwargs.get("session_id"), profile)` and
-supply that result to `runtime.origin`. Never take session_id or destination from
-model arguments. No ID, unknown ID, expired binding, or wrong profile fails closed.
-Run `/gws-bind` after `/new`, plugin restart/reload, or expiry. A command issued
-before the host has a physical session cannot bind: first establish a conversation,
-then bind. Delegated children do not inherit bindings, even when their environment
-inherits the parent's routing fields and changes only its physical ID.
+This deliberately uses internal `gateway.session_context._bound_session_value`
+and `agent.delegation_context.is_delegated_child_process_context`, because the
+public environment getter can borrow process-global routes and inherited child
+context. It is a narrow compatibility exception, not a public-API-only claim.
+Missing APIs/context fail closed. No Hermes core patch is required.
 
 `RouteManager(ctx=None, *, home=None, store=None, config=None, profile="default")`
 uses the existing WatchStore transaction API. Pass the SAME profile-local store to
@@ -85,8 +74,8 @@ routes:
 
 Each origin is an exact six-field match, including null thread_id; no wildcard or
 model-selected route. At most 1024 configured entries. Duplicate matches refuse.
-Physical IDs are deliberately not in operator configuration: `/new` requires a new
-command binding, but need not recreate the operator route. Non-default profiles
+Physical IDs are deliberately not in operator configuration: a new watch after
+`/new` captures the new physical context without recreating the operator route. Non-default profiles
 must use `/p/PROFILE/webhooks/NAME`. HTTPS is required except loopback HTTP. No
 URL credentials, query strings, fragments, or redirects are accepted. The bridge
 name MUST start with `gws-watch-bridge-`; the hook suppresses this namespace even
@@ -126,16 +115,14 @@ from plugin state. Provision a route separately for each exact native destinatio
 
 Inspected real host `/home/xithus/.hermes/hermes-agent`:
 
-- `hermes_cli/plugin_command_dispatch.py:11-32` forwards only declared trusted
-  command context. The tests execute this actual function, not a replacement.
-- `gateway/run_inbound_hooks.py:279-319` provides source, physical session_id,
-  session_key and platform to commands, including before the agent-turn binding.
-- The public API inventory `hermes_cli/data/plugin_api.json` exposes
-  `gateway.session_context:get_session_env`, but no exact physical-ID-bound trusted
-  origin getter. That getter can fall back to process environment; route fields
-  can also be inherited by a delegated child whose ID is rebound. Public
-  `hermes_cli.plugin_session` has no authenticated actor+route binding API either.
-  Therefore explicit command binding is necessary, not automatic hook correlation.
+- `gateway/session_context.py` supplies bound-only ContextVar reads and clears
+  actor identity when the active turn event becomes mixed/anonymous. The adapter
+  requires those bound values, not public `get_session_env`'s environment fallback.
+- `agent/delegation_context.py` supplies a context-local/process delegation guard.
+  Tests exercise the real `delegated_child_context`, including physical-ID rebinding.
+  An ID equality check alone does not prove that a parent route belongs to a child.
+- These internal contracts must be revalidated on host upgrades. Tests use real host
+  helpers with synthetic route values; they do not substitute for live delivery.
 - `gateway/platforms/webhook.py:791-825` builds native authenticated webhook
   source platform, `chat_name=webhook/NAME`, `user_id=webhook:NAME`, routed profile,
   and raw payload. The hook requires that exact source identity/profile plus the
@@ -152,11 +139,10 @@ Inspected real host `/home/xithus/.hermes/hermes-agent`:
 
 Important limitations:
 
-1. Tool kwargs identify a physical session, not the current human actor. Binding
-   captures the actor who ran the command, not proof of each later caller. Use
-   sender-isolated sessions/trusted conversations; this API cannot provide per-turn
-   actor authorization in shared multi-user physical sessions. Conflicting rebinds
-   refuse, but do not solve that host limitation.
+1. Tool kwargs alone identify a physical session, not an actor. The adapter also
+   requires the current bound actor and refuses mixed/cleared actor turns. This
+   depends on host context propagation and is not isolation against a malicious
+   plugin or operator. Use trusted conversations or sender-isolated sessions.
 2. Operator config is an attestation of the remote native route's destination,
    prompt, profile, skills and signature mode. There is no public readback API here
    to prove the receiver still matches it. Direct receiver edits without updating
@@ -169,6 +155,8 @@ Important limitations:
 4. Same-session true means scheduled/admitted. False or exception after claiming
    becomes uncertain and is not blindly replayed. Crash recovery retains the
    existing durable outbox uncertainty behavior. No exactly-once guarantee.
-5. This task tests synthetic sources, real public command invocation, and loopback
-   HTTP redirect refusal. It does NOT demonstrate live Hermes receiver delivery,
-   real account auth, or the CI minimum-host version; those remain release gates.
+5. Origin regression tests exercise real host ContextVars with synthetic routes,
+   delegated children, concurrent contexts and actor clearing. Route tests include
+   loopback HTTP redirect refusal. These do not prove live automatic-origin watch
+   delivery or fresh OAuth; see [verification](verification.md) for separately
+   measured end-to-end coverage.

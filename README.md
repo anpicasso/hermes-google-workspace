@@ -6,7 +6,7 @@ Multi-account Google Workspace access through the [native `gws` CLI](https://git
 
 ## Install and configure
 
-Requirements: Hermes with the public plugin APIs described in [compatibility](docs/compatibility.md), native `gws` (tested baseline 0.22.5), and the Python dependencies declared in `plugin.yaml` (PyYAML, aiohttp and google-auth with requests). Watches require POSIX locking and a separately supervised worker. No binary, cloud provisioning or worker auto-start is included.
+Requirements: Hermes with the plugin APIs and bound-context compatibility adapter described in [compatibility](docs/compatibility.md), native `gws` (tested baseline 0.22.5), and the Python dependencies declared in `plugin.yaml` (PyYAML, aiohttp and google-auth with requests). Watches require POSIX locking and a separately supervised worker. No binary, cloud provisioning or worker auto-start is included.
 
 For this development branch, install the exact tested commit rather than assuming a release exists:
 
@@ -32,6 +32,8 @@ The legacy `gws-oauth` storage name is deliberately retained; renaming the plugi
 The optional private `gws-remote-auth` companion adds chat-based `gws_login` and approval-gated local `gws_logout`. It is not needed for public operation and is not bundled here. Never paste client JSON or refresh tokens into chat.
 
 ## Tools
+
+Load the bundled operational skill with `skill_view("google-workspace:workspace")`; it covers accounts, agent-driven watches and public HTTPS ingress options.
 
 The public plugin registers **18 tools**:
 
@@ -62,7 +64,7 @@ Drive changes.watch → HTTPS callback                 ├→ durable hints/curs
 Calendar events.watch → HTTPS callback               ┘  → local filters → outbox → Hermes
 ```
 
-Each tool supports `start`, `status`, `stop`, a bounded lifetime, and `same_session` or `new_session` delivery. Run `/gws-bind` in the intended conversation first: the public command context binds its actual session and sender, without borrowing process-global route variables. Unbound tool calls fail closed.
+Each tool supports `start`, `status`, `stop`, a bounded lifetime, and `same_session` or `new_session` delivery. The agent starts watches directly: the plugin captures the current bound runtime session and actor automatically, with no manual bind command or model-selected destination. Missing context, mixed/cleared actors and delegated children fail closed. This small internal-host compatibility exception is documented in [the route contract](docs/routes-contract.md).
 
 The operator provisions delivery routes and public HTTPS ingress; one separately supervised worker per profile owns renewal, reconciliation and cleanup. Gmail push uses verified Google OIDC identity, exact audience/subscription/mailbox checks and durable acceptance before acknowledgement. Google API reads and renewals remain short account-locked native CLI calls. We do not run a persistent native watch alongside calls sharing its credential cache.
 

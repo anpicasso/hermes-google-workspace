@@ -1,5 +1,6 @@
 """Profile-scoped Workspace tools. Native gws owns credentials and refresh."""
 import json
+from pathlib import Path
 
 from .router import _ACCOUNT, account_health, bounded_gws, execute_gws, list_accounts
 
@@ -41,13 +42,12 @@ def register(ctx):
     from hermes_constants import get_hermes_home
     from . import watch as W
     from . import watch_calendar, watch_drive, watch_gmail, watch_routes, watch_tools
-    from .session_origin import OriginBindings
+    from .session_origin import current_origin
     from .workspace_tools import SCHEMAS, build_args
     from .api_policy import make_pre_tool_call_hook
 
     home = get_hermes_home().resolve()
     profile = getattr(ctx, "profile_name", None) or "default"
-    bindings = OriginBindings()
 
     def root():
         if get_hermes_home().resolve() != home:
@@ -103,20 +103,11 @@ def register(ctx):
 
         def origin(self, session_id=None):
             root()
-            return bindings.origin(session_id, profile)
+            return current_origin(session_id, profile)
 
     runtime = Runtime()
+    ctx.register_skill("workspace", Path(__file__).parent / "skills/workspace/SKILL.md")
 
-    async def bind(raw_args="", **kwargs):
-        try:
-            root()
-            return await bindings.bind(raw_args, source=kwargs.get("source"),
-                session_id=kwargs.get("session_id"), session_key=kwargs.get("session_key"),
-                platform=kwargs.get("platform"), profile=profile)
-        except Exception:
-            return "GWS binding refused: trusted context is unavailable for this profile."
-
-    ctx.register_command("gws-bind", bind, description="Bind Workspace watch delivery to this session")
     ctx.register_hook("pre_tool_call", make_pre_tool_call_hook(build_args, SCHEMAS))
 
     def accounts(args, **kwargs):
