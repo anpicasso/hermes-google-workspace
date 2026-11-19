@@ -8,9 +8,10 @@ Type=simple
 # Set the exact profile home; never rely on the login shell's default profile.
 Environment=HERMES_HOME=/home/example/.hermes
 # Replace with the immutable checkout/runtime path.
-WorkingDirectory=/opt/hermes-gws-oauth
-ExecStart=/home/example/.hermes/hermes-agent/venv/bin/python /opt/hermes-gws-oauth/watch_worker.py run \
+WorkingDirectory=/opt/hermes-google-workspace
+ExecStart=/home/example/.hermes/hermes-agent/venv/bin/python /opt/hermes-google-workspace/watch_worker.py run \
   --home /home/example/.hermes \
+  --profile default \
   --gws-bin /usr/local/bin/gws \
   --callback-host 127.0.0.1 \
   --callback-port 8765 \
@@ -19,9 +20,9 @@ ExecStart=/home/example/.hermes/hermes-agent/venv/bin/python /opt/hermes-gws-oau
   --callback-url https://watch.example.com
 Restart=on-failure
 RestartSec=10
-# Use the dependency-complete Hermes Python above (aiohttp + PyYAML).
-# Native route CAS uses atomic rename in the profile root; token refresh also writes.
-# This grants the selected profile write access, not just the SQLite directory.
+# Use a dependency-complete Python (aiohttp, PyYAML, google-auth and requests).
+# The worker writes watch state; native gws writes its own credential/cache files.
+# Delivery routes are provisioned by the operator, not modified by this worker.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

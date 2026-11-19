@@ -1,38 +1,24 @@
-# Manual OAuth client setup required
+# Connect native accounts, then opt in to watches
 
-**Not catalog-admitted:** native `gws` credential handling conflicts with current Hermes OAuth policy. Read [the full disclaimer](docs/catalog-policy.md) and [Google Cloud setup instructions](docs/oauth-setup.md) before connecting accounts.
+`google-workspace` delegates credential storage and refresh to native `gws`. It does not implement OAuth or automatically import global credentials. One Hermes profile belongs to one trusted operator; all authorized sessions in that profile can use its accounts.
 
-Plugin activation creates the private directory:
+## Connect an account
 
-```text
-$HERMES_HOME/gws-oauth/
-```
+1. Configure your own Google Cloud **Desktop OAuth client** and enable the APIs you need: [Google Cloud setup](docs/oauth-setup.md).
+2. Follow [native login and account selection](docs/login.md) to authorize each account in its explicit profile-scoped native configuration directory. Keep client files and credentials outside the plugin directory, with private permissions. Never paste client JSON or tokens into chat.
+3. Start a fresh session to load the updated tool schemas. Use `gws_accounts(check_health=true)` to check native authentication; stored credentials alone do not prove a working session.
 
-Check the installer result for live gateway reload; support depends on the host. Begin a fresh session for updated tool schemas. For CLI, TUI, Desktop or API use, load the updated plugin in the frontend's agent process and open a fresh session; no messaging gateway is required.
+Native `gws auth` is available in an operator terminal with the account configuration selected. Agent-facing `gws_api` intentionally refuses auth commands, including credential export. The optional **private** `gws-remote-auth` companion supplies `gws_login` and `gws_logout` for remote-browser authorization; those tools are not part of this public plugin. Stop watches and let remote cleanup finish before replacing or removing credentials. Local logout does not revoke Google consent.
 
-Before calling `gws_login`, configure a Google Desktop OAuth client in either location:
+Prefer curated Gmail/Drive/Calendar tools, `gws_schema` for request discovery, and guarded `gws_api` for other native operations. Mutations and local file input/output require Hermes approval.
 
-```text
-~/.config/gws/client_secret.json                 # native global gws client
-$HERMES_HOME/gws-oauth/client_secret.json        # optional profile override
-```
+## Watches are opt-in
 
-The profile file wins when both exist. Set file permissions to `0600`. Do not paste or upload the JSON through chat, and do not store it inside the plugin directory. Authorized accounts remain profile-scoped even when the client is global.
+Installation does not start a worker, provision cloud resources, or create delivery routes. Follow [watch setup](docs/watch-setup.md) for:
 
-To renew an account that is already configured, call `gws_login` with `reauthorize=true` after this version is installed. The previous credentials stay in place until the new browser flow reports the requested identity. A mismatch, cancellation, or timeout leaves them intact; a failed replacement attempts to restore them. Avoid simultaneous native commands during the brief swap. See README for crash-recovery limitations. Use `gws_accounts(check_health=true)` for an optional live check that distinguishes stored credentials from a session confirmed by native `gws`.
+- Operator-provisioned native Hermes webhook routes and exact route attestations.
+- A supervised worker with a loopback listener and public HTTPS forwarding of only its Google callback paths.
+- Gmail authenticated Pub/Sub PUSH with topic publisher IAM, a dedicated service-account identity and exact OIDC audience; Drive/Calendar channel callbacks.
+- `/gws-bind` in the intended conversation before starting a watch. Bind again after a new session, plugin reload/restart or binding expiry.
 
-If the browser runs on the same host as Hermes, the redirect reaches the `gws` loopback directly and the login completes without pasting anything; the browser shows "Success". Confirm with `gws_accounts` or by calling `gws_login` with the same `account` and `action="status"`. Existing accounts and other profiles are untouched by this upgrade; a running gateway must be reloaded for the new behaviour to take effect.
-
-Run `gws auth status` to inspect the exact native `client_config` path on systems using a legacy location.
-
-## Account and command policy
-
-One profile belongs to one trusted operator; connect that operator’s Google accounts only. Every authorized session in the profile can use those accounts. Full OAuth scope mode remains the default; the configured client and Google consent determine what can actually be granted.
-
-Prefer curated Gmail/Drive/Calendar tools for common operations, `gws_schema` for native request discovery, and `gws_api` for the rest. Public tools refuse native auth export/login/logout/setup commands; use `gws_login`, `gws_logout` and `gws_accounts(check_health=true)` instead. Native `gws auth` remains available in an operator terminal when configured; its client JSON is reusable, but global account credentials are not automatically imported. Local logout does not revoke Google consent; stop watches and finish cleanup first. Mutations, destructive operations and local file input/output use Hermes approval, not a model-supplied confirmation flag.
-
-## Targeted watches are opt-in
-
-The Gmail/Drive/Calendar watch tools are registered after upgrade, but nothing is subscribed or started by installation. `new_session` starts need a native Hermes webhook route, and Drive/Calendar need `watch_callback_url`; Gmail needs a Pub/Sub topic and subscription. No worker starts automatically, and no Google resource is created until an explicit `gws_*_watch action=start` and the separately supervised worker run. See `docs/watch-setup.md`.
-
-Same-session watches use the existing GOWA-style `pre_gateway_dispatch` bridge: check the stored physical session against the current session, then call `ctx.inject_message(session_key=...)`. No Hermes core patch is required. A reset observed before injection stops forwarding; a concurrent `/new` between this check and the host lookup can still race. Injection acceptance means scheduled, not delivered; ambiguous injections are not replayed.
+Same-session delivery requires explicit injection permission. Session lookup and injection are not atomic: a concurrent `/new` can still race. HTTP admission or injection acceptance is not proof of delivery. See [compatibility and limitations](docs/compatibility.md) and [catalog notes](docs/catalog-policy.md).
