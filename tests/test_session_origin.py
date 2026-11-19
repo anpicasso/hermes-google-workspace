@@ -27,7 +27,7 @@ class OriginTests(unittest.TestCase):
         return asyncio.run(self.bindings.bind("", **{**self.context, **kwargs}))
 
     def test_real_public_command_invocation_seam(self):
-        host = Path(os.environ.get("HERMES_AGENT_ROOT", "/home/xithus/.hermes/hermes-agent"))
+        host = Path(os.environ.get("HERMES_AGENT_SRC", Path.home() / ".hermes" / "hermes-agent"))
         path = host / "hermes_cli/plugin_command_dispatch.py"
         self.assertTrue(path.is_file(), "Real host command dispatch source is required")
         spec = importlib.util.spec_from_file_location("host_command_dispatch", path)
