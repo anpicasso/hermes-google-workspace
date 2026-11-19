@@ -23,12 +23,14 @@ class RegistrationTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.active_home = self.home
         self.tools, self.commands, self.hooks, self.skills = {}, {}, {}, {}
+        self.cli_commands = {}
         self.home_patch = patch("hermes_constants.get_hermes_home", side_effect=lambda: self.active_home)
         self.home_patch.start()
         self.addCleanup(self.home_patch.stop)
         self.ctx = SimpleNamespace(profile_name="default",
             get_config=lambda key, default=None: default,
             register_skill=lambda name, path: self.skills.setdefault(name, path),
+            register_cli_command=lambda name, **kw: self.cli_commands.setdefault(name, kw),
             register_tool=lambda **kw: self.tools.setdefault(kw["name"], kw),
             register_hook=lambda name, cb: self.hooks.setdefault(name, cb),
             register_command=lambda name, cb, **kw: self.commands.setdefault(name, cb),
@@ -44,6 +46,7 @@ class RegistrationTests(unittest.TestCase):
             "gws_drive_watch", "gws_calendar_watch"} | set(SCHEMAS))
         self.assertNotIn("gws_public_test.oauth", sys.modules)
         self.assertEqual(self.commands, {})
+        self.assertEqual(set(self.cli_commands), {"gws"})
         self.assertEqual(set(self.skills), {"workspace"})
         self.assertTrue(self.skills["workspace"].is_file())
         self.assertFalse((self.home / "gws-oauth").exists())

@@ -212,7 +212,7 @@ def _account_env(path):
         yield env
 
 
-def _run_gws(root, path, args, *, gws_bin, timeout):
+def _run_gws(root, path, args, *, gws_bin, timeout, capture_output=True):
     """Caller holds _native_guard. Resolve the CLI before changing child CWD."""
     binary = shutil.which(os.fspath(gws_bin))
     if binary is None:
@@ -221,7 +221,7 @@ def _run_gws(root, path, args, *, gws_bin, timeout):
     with _account_env(path) as env:
         return subprocess.run(
             [str(Path(binary).absolute()), *args], env=env, cwd=files_dir(root),
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=capture_output, text=True, timeout=timeout,
         )
 
 

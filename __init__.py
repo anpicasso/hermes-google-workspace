@@ -142,6 +142,9 @@ def register(ctx):
                 gws_bin=ctx.get_config("gws_bin", default="gws")) for name in names}
         return payload
 
+    from .account_cli import register_cli
+    register_cli(ctx, root, accounts)
+
     def api(args, **kwargs):
         return execute_gws(root(), args.get("account"), args.get("args"),
                            gws_bin=ctx.get_config("gws_bin", default="gws"))

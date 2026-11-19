@@ -69,6 +69,7 @@ class HostIntegrationTests(unittest.TestCase):
             profile_name="default",
             register_command=lambda *args, **kwargs: None,
             register_skill=lambda *args, **kwargs: None,
+            register_cli_command=lambda *args, **kwargs: None,
             get_config=lambda key, default=None: default,
             register_tool=lambda **kwargs: tools.setdefault(kwargs["name"], kwargs),
             register_hook=lambda name, callback: hooks.append(name),

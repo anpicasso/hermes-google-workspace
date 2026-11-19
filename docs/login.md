@@ -1,55 +1,58 @@
 # Native login, reauthorization and logout
 
-The public `google-workspace` plugin does not implement OAuth. **Native gws owns consent, credential storage and refresh.** Configure a [Google Cloud Desktop OAuth client](oauth-setup.md) first. One Hermes profile represents one trusted operator; its account slots are not independent tenants.
+The public plugin wraps **native gws**, which owns consent, credential storage and refresh. The wrapper selects the profile/account directory, isolates the process environment and coordinates lifecycle locks. It never reads, exports or refreshes Google tokens. One Hermes profile represents one trusted operator.
 
-## Provision one account (POSIX)
+## Commands
 
-Stop the watch worker and avoid concurrent plugin calls while provisioning or changing credentials manually. Stop existing account watches and let remote cleanup finish **before** stopping the worker. Direct terminal auth does not participate in the companion lifecycle guard.
-
-Use the actual profile home, not an assumed shell `HERMES_HOME`. Replace the example values:
+Install/enable `google-workspace` first, then run these in a local terminal:
 
 ```bash
-PROFILE_HOME="$HOME/.hermes"
-ACCOUNT="person@example.com"
-SLOT="$PROFILE_HOME/gws-oauth/accounts/$ACCOUNT"
-GWS_BIN="$(command -v gws)"
-install -d -m 700 "$SLOT" "$SLOT/.home"
-install -m 600 /secure/path/downloaded-client.json "$SLOT/client_secret.json"
-AUTH_CWD="$(mktemp -d)"
-touch "$AUTH_CWD/.env"
-(
-  cd "$AUTH_CWD" || exit 1
-  env -i PATH="$PATH" HOME="$SLOT/.home" \
-    GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$SLOT" \
-    GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file \
-    "$GWS_BIN" auth login --readonly
-)
-rm "$AUTH_CWD/.env"
-rmdir "$AUTH_CWD"
+hermes gws login person@example.com --client-file /secure/path/desktop-client.json --readonly
+hermes gws accounts
+hermes gws status person@example.com
+hermes gws logout person@example.com
 ```
 
-Use an absolute `PROFILE_HOME`, lowercase account spelling, and an absolute `GWS_BIN`. The disposable working directory and empty `.env` prevent native dotenv ancestor discovery. Do not place ADC or unrelated config under the isolated HOME. On Windows, use equivalent user-only ACLs and an explicit environment including the required system variables.
+- **login:** invokes `gws auth login` with native terminal/browser interaction in a fresh staging slot. It verifies the Google identity through native gws before activating the slot. Repeating login reauthorizes; cancellation, native failure or wrong identity preserves the old slot. The command has a ten-minute timeout. No browser callback is intercepted by the public plugin.
+- **accounts:** lists this profile's stored native slots without a network call. A slot name alone does not prove identity or current validity.
+- **status:** runs native `gws auth status`, returns sanitized health/scopes, and exits nonzero if validity cannot be confirmed. It does not print credentials or raw native output.
+- **logout:** invokes native `gws auth logout` for only that account and checks that local credential files were cleared. It may leave the directory/client file. This is local logout, **not Google-side consent revocation**.
 
-`--readonly` is an example, not sufficient for every watch or write operation. Consult `gws auth login --help` for native presets/custom scopes. Gmail watch requires an appropriate Gmail scope; Pub/Sub push uses the operator's IAM configuration, not a Python-exported mailbox token. Drive/Calendar watch setup may require broader access than ordinary reads.
+Use `hermes --profile <name> gws ...` for another profile. Account arguments are Google email addresses, normalized to lowercase. The wrapper sets the absolute `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`, file keyring, disposable isolated HOME and dotenv-safe working directory automatically. Existing storage remains at `$HERMES_HOME/gws-oauth/accounts/<account>/`.
 
-Complete consent using a browser on the same host, or a supported native remote-login method. If the browser is elsewhere, its localhost is not the Hermes machine. The public plugin does not intercept callback pastes; do not paste them into an ordinary chat expecting it to finish login.
+Login/logout refuse while that account has active watches or unfinished remote cleanup. Stop those watches and let the worker finish cleanup, then retry. Cooperative execution/swap locks protect normal API calls; you do not need to stop calls for unrelated accounts. Do not bypass these locks with concurrent manual native auth.
 
-Repeat with another account and another `SLOT` for multiple accounts. Do not copy credential/cache/key files between slots. Logging in to global gws does not automatically register an account here.
+## Client and scopes
 
-## Verify identity and access
+Create your own [Google Cloud Desktop OAuth client](oauth-setup.md). `--client-file` accepts that client configuration, **not** an exported account credential. Without the flag, login reuses the account's `client_secret.json`, then the profile's `gws-oauth/client_secret.json`. It never silently borrows global credentials or an unrelated Google account.
 
-In the same isolated environment, run native `gws auth status` and inspect its `user` identity locally; do not post raw output. Confirm it matches the slot account. If native status cannot confirm identity, obtain appropriate identity scope or verify with a service identity endpoint such as Gmail `users.getProfile` when authorized. A valid token or directory name alone is not identity proof.
+```bash
+hermes gws login person@example.com --readonly
+hermes gws login person@example.com --full
+hermes gws login person@example.com --scopes 'email,https://www.googleapis.com/auth/gmail.readonly'
+hermes gws login person@example.com --services gmail,drive,calendar
+```
 
-Then use `gws_accounts(account="person@example.com", check_health=true)` and a bounded curated read. No credentials are returned by the health tool. Successful login does not guarantee API enablement or all requested scopes.
+`--readonly`, `--full` and `--scopes` are mutually exclusive native options. With none, gws uses its native scope picker. `--services` filters that picker. `--full` includes Pub/Sub/cloud scopes; choose deliberately. Include an identity-capable grant (`email`/userinfo, or suitable Gmail scope) so native identity verification can succeed; Drive/Calendar-only grants without identity access are refused at activation. Consent does not guarantee all requested scopes were granted or APIs enabled.
 
-## Reauthorize or log out
+Native login is interactive: complete it in a terminal with an appropriate browser. On a remote server, a browser's localhost is not the server's localhost; arrange a supported native loopback/tunnel workflow or use the optional private companion. Never paste callback URLs or client JSON into ordinary chat expecting the public wrapper to intercept them.
 
-First stop all watches for that account and wait for cleanup. Pause the worker and other calls. Reuse the isolated environment above, replacing `auth login --readonly` with the intended native login command or `auth logout`. Do not run auth against a shared store concurrently with plugin calls.
+## Binary resolution
 
-Native logout clears native credentials/cache; it may leave the directory/client file. It is **local logout, not Google-side consent revocation**. Revoke the app separately in Google Account settings if needed. Other account directories remain independent.
+By default the plugin resolves `gws` on PATH. An explicit setting takes precedence for the CLI, tools and worker:
 
-## Optional conversational login
+```yaml
+plugins:
+  entries:
+    google-workspace:
+      settings:
+        gws_bin: /absolute/path/to/gws
+```
 
-The private `gws-remote-auth` companion adds `gws_login` start/status/cancel/reauthorize and approval-gated `gws_logout`. It coordinates account replacement/removal with public watches through a versioned lifecycle query and shared account lock. It is optional, separately installed, and not part of this public release. Follow its own callback privacy and setup instructions.
+An explicitly configured missing/non-executable binary fails; it does not silently fall back to another binary. Set a filename/path, not a shell command or flags. Paths containing spaces are supported. No binary is installed automatically.
 
-Without that companion, asking the agent to log in returns native operator guidance rather than handling credentials in Python. Do not enable the old combined `gws-oauth` plugin alongside the renamed public plugin: their tool names overlap.
+## Recovery and boundaries
+
+Normal login errors roll back without replacing the old slot. A process/host crash can leave a hidden `.native-login-*` staging directory or `.backup-*` account directory: inspect these locally with no auth process running before cleanup; never copy token/cache/key files between identities. Backups are retained if cleanup fails. Same-user malicious filesystem replacement is not a supported isolation boundary.
+
+The private `gws-remote-auth` companion supplies conversational `gws_login` start/status/cancel and approval-gated `gws_logout`; it is optional and separately installed. This public CLI is operator-side only, not a new agent tool or gateway slash command. `gws_api` still blocks native auth/export. Do not enable the old combined `gws-oauth` plugin alongside this plugin because tool names collide.

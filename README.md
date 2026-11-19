@@ -19,7 +19,16 @@ Use `hermes --profile <name>` for another profile. Check the installer result fo
 
 ### Google OAuth and accounts
 
-You need your own **Google Cloud Desktop app OAuth client**, not an API key. The `gcloud` executable is optional for login. [Create the client, enable APIs and configure consent](docs/oauth-setup.md), then use [native per-account login/logout](docs/login.md).
+You need your own **Google Cloud Desktop app OAuth client**, not an API key. The `gcloud` executable is optional for login. [Create the client, enable APIs and configure consent](docs/oauth-setup.md), then use [native per-account login/logout](docs/login.md):
+
+```bash
+hermes gws login person@example.com --client-file /secure/path/desktop-client.json --readonly
+hermes gws accounts
+hermes gws status person@example.com
+hermes gws logout person@example.com
+```
+
+These local commands handle account directories and isolation automatically; native gws still performs OAuth. `gws` is resolved on PATH unless `plugins.entries.google-workspace.settings.gws_bin` sets an explicit executable. Login/logout refuse active watches or pending cleanup.
 
 Each account has a native configuration directory:
 

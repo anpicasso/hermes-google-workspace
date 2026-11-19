@@ -16,14 +16,20 @@ process it locally and remove it after use.
 
 ## Login
 
-The public plugin delegates credentials and refresh to native gws. It has no login
-CLI wrapper: the operator provisions an isolated per-account native directory using
-the repository's `docs/login.md` procedure. Do not recommend global `gws auth login`
-as equivalent: slots live under the exact profile home at
-`gws-oauth/accounts/<account>/`. Native auth must use that configuration directory,
-file keyring, isolated HOME and dotenv-safe working directory. Stop watches and
-finish cleanup before changing credentials; avoid concurrent manual auth/API calls.
-The optional private companion supplies `gws_login` and `gws_logout` instead.
+Use local operator commands `hermes gws login EMAIL --client-file /path/to/desktop-client.json`,
+`hermes gws accounts`, `hermes gws status EMAIL` and `hermes gws logout EMAIL`.
+Login delegates to native gws; flags `--readonly`, `--full` or `--scopes` select
+consent scope, and `--services` filters the native picker. Never request broader
+access than needed. Without --client-file, reuse account then profile client config.
+The wrapper isolates account directories/HOME/environment, verifies identity before
+activation and preserves existing credentials if consent fails. Stop watches and
+finish cleanup before login/logout; the lifecycle guard refuses otherwise.
+For another profile use `hermes --profile NAME gws ...`. Binary selection is PATH
+by default or `plugins.entries.google-workspace.settings.gws_bin` in YAML.
+Do not recommend global `gws auth login` as equivalent. These are terminal commands,
+not agent tools: use the optional private `gws_login`/`gws_logout` for conversational
+authorization. Never read/export tokens or intercept callbacks in the public plugin.
+See `docs/login.md` for native browser/remote-server limitations.
 
 ## Agent-driven watches
 
