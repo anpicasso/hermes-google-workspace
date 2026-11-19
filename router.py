@@ -193,28 +193,23 @@ def list_accounts(root):
     return sorted(names)
 
 
+@contextmanager
 def _account_env(path):
-    """Select a native store without inheriting tokens, ADC, proxies or logging.
+    """Keep native credentials persistent, but give each child a fresh HOME.
 
-    HOME is account-local because gws falls back to ~/.config/gcloud even with
-    an explicit CONFIG_DIR. File-tool paths should be absolute, not HOME-relative.
+    gws may invoke gcloud, which creates ~/.config during status checks. Never
+    reuse that HOME: it is an ADC fallback location even with CONFIG_DIR set.
     """
     path = _safe_path(path)
-    home = _safe_path(path / ".home")
-    home.mkdir(mode=0o700, exist_ok=True)
-    home.chmod(0o700)
-    # Native gws uses CONFIG_DIR for its own files; no gcloud config belongs here.
-    config = home / ".config"
-    if config.exists() or config.is_symlink():
-        raise ValueError("Refusing a non-isolated account HOME")
-    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home),
-           "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": str(path),
-           "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"}
-    if os.name == "nt":  # pragma: no cover - Windows
-        env["USERPROFILE"] = str(home)  # dirs::home_dir uses USERPROFILE on Windows.
-        if "SYSTEMROOT" in os.environ:
-            env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
-    return env
+    with tempfile.TemporaryDirectory(prefix=".exec-home-", dir=path) as home:
+        env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": home,
+               "GOOGLE_WORKSPACE_CLI_CONFIG_DIR": str(path),
+               "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"}
+        if os.name == "nt":  # pragma: no cover - Windows
+            env["USERPROFILE"] = home
+            if "SYSTEMROOT" in os.environ:
+                env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        yield env
 
 
 def _run_gws(root, path, args, *, gws_bin, timeout):
@@ -223,10 +218,11 @@ def _run_gws(root, path, args, *, gws_bin, timeout):
     if binary is None:
         raise FileNotFoundError("gws executable not found")
     # absolute(), not resolve(): retain executable symlink/wrapper semantics.
-    return subprocess.run(
-        [str(Path(binary).absolute()), *args], env=_account_env(path), cwd=files_dir(root),
-        capture_output=True, text=True, timeout=timeout,
-    )
+    with _account_env(path) as env:
+        return subprocess.run(
+            [str(Path(binary).absolute()), *args], env=env, cwd=files_dir(root),
+            capture_output=True, text=True, timeout=timeout,
+        )
 
 
 def _failure(code, message, action, *, category, reauth_required, returncode, http_status=None):

@@ -25,6 +25,27 @@ def _fake_gws(tmp, body):
 
 
 class RouterTests(unittest.TestCase):
+    def test_native_gcloud_side_effect_does_not_poison_next_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            slot = _account(tmp)
+            fake = _fake_gws(tmp, """import json, os
+from pathlib import Path
+home = Path(os.environ['HOME'])
+config = home / '.config/gcloud'
+assert not config.exists()
+config.mkdir(parents=True)
+(config / 'active_config').write_text('default')
+print(json.dumps({'home': str(home), 'mode': home.stat().st_mode & 0o777}))
+""")
+            homes = []
+            for _ in range(2):
+                result = bounded_gws(tmp, slot.name, ['drive', 'files', 'list'], gws_bin=str(fake))
+                self.assertTrue(result['ok'], result)
+                homes.append(result['data']['home'])
+                self.assertEqual(result['data']['mode'], 0o700)
+            self.assertNotEqual(*homes)
+            self.assertTrue(all(not Path(home).exists() for home in homes))
+
     def test_native_dotenv_ancestor_injection_is_stopped_by_empty_sentinel(self):
         import subprocess
         from router import _account_env
@@ -38,8 +59,9 @@ class RouterTests(unittest.TestCase):
             (root / ".env").write_text("GOOGLE_WORKSPACE_CLI_TOKEN=synthetic-dotenv-only\n")
             unguarded = root / "unguarded"
             unguarded.mkdir()
-            result = subprocess.run([binary, "auth", "status"], env=_account_env(slot),
-                                    cwd=unguarded, capture_output=True, text=True, timeout=10)
+            with _account_env(slot) as env:
+                result = subprocess.run([binary, "auth", "status"], env=env,
+                                        cwd=unguarded, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0)
             self.assertEqual(json.loads(result.stdout)["credential_source"], "token_env_var")
             result = bounded_gws(root, slot.name, ["auth", "status"], gws_bin=binary)
@@ -177,7 +199,7 @@ print(json.dumps({'token_valid': isolated, 'isolated': isolated, 'home': str(hom
                     self.assertEqual(result["data"]["backend"], "file")
                     home = Path(result["data"]["home"])
                     self.assertTrue(home.is_relative_to(slot))
-                    self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+                    self.assertFalse(home.exists())
                 self.assertTrue(account_health(root, slot.name, gws_bin=str(fake))["valid"])
                 self.assertEqual(os.environ["HOME"], str(foreign))
 
@@ -261,28 +283,19 @@ print(json.dumps({'token_valid': isolated, 'isolated': isolated, 'home': str(hom
                     run.assert_not_called()
 
     @unittest.skipIf(os.name != "posix", "POSIX symlink regression")
-    def test_isolated_home_and_lock_symlinks_fail_closed(self):
+    def test_lock_symlinks_fail_closed(self):
         import hashlib
-        from router import _account_env
-        for part in ("home", "adc", "swap_lock", "account_lock", "lock_dir"):
+        for part in ("swap_lock", "account_lock", "lock_dir"):
             with self.subTest(part=part), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "profile"
                 slot = _account(root)
-                home = Path(_account_env(slot)["HOME"])
-                self.assertTrue(home.is_relative_to(slot))  # Never mutate a real HOME on failure.
                 foreign = Path(tmp) / "foreign"
                 foreign.mkdir()
-                if part == "home":
-                    home.rmdir()
-                    home.symlink_to(foreign)
-                elif part == "adc":
-                    (home / ".config").symlink_to(foreign)
-                else:
-                    name = hashlib.sha256(slot.name.encode()).hexdigest()[:32]
-                    target = {"swap_lock": slot.parent / ".lock", "lock_dir": root / ".locks",
-                              "account_lock": root / ".locks" / f"{name}.lock"}[part]
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.symlink_to(foreign if part == "lock_dir" else foreign / "missing")
+                name = hashlib.sha256(slot.name.encode()).hexdigest()[:32]
+                target = {"swap_lock": slot.parent / ".lock", "lock_dir": root / ".locks",
+                          "account_lock": root / ".locks" / f"{name}.lock"}[part]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(foreign if part == "lock_dir" else foreign / "missing")
                 with mock.patch("router.subprocess.run") as run:
                     self.assertFalse(bounded_gws(root, slot.name, ["auth", "status"])["ok"])
                     run.assert_not_called()
@@ -357,9 +370,14 @@ print(json.dumps({'token_valid': isolated, 'isolated': isolated, 'home': str(hom
     def test_large_response_write_failure_is_sanitized(self):
         with tempfile.TemporaryDirectory() as tmp:
             _account(tmp)
+            mkdtemp = tempfile.mkdtemp
+            def fail_response(*args, **kwargs):
+                if kwargs.get("prefix") == "response-":
+                    raise OSError("private-details")
+                return mkdtemp(*args, **kwargs)
             with mock.patch("router.subprocess.run", return_value=mock.Mock(
                 returncode=0, stdout="x" * 210_000, stderr=""
-            )), mock.patch("tempfile.mkdtemp", side_effect=OSError("private-details")):
+            )), mock.patch("tempfile.mkdtemp", side_effect=fail_response):
                 result = execute_gws(tmp, "person@example.com", ["anything"])
             self.assertFalse(result["ok"])
             self.assertEqual(result["error_code"], "output_write_failed")
