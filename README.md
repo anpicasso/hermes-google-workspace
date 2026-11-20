@@ -8,11 +8,11 @@ Multi-account Google Workspace access through the [native `gws` CLI](https://git
 
 Requirements: Hermes with the plugin APIs and bound-context compatibility adapter described in [compatibility](docs/compatibility.md), native `gws` (tested baseline 0.22.5), and the Python dependencies declared in `plugin.yaml` (PyYAML, aiohttp and google-auth with requests). Watches require POSIX locking and a separately supervised worker. No binary, cloud provisioning or worker auto-start is included.
 
-Install the v0.9.0 release:
+Install the v0.9.1 release:
 
 ```bash
-hermes plugins install anpicasso/hermes-google-workspace --ref v0.9.0 --enable
-hermes config set plugins.entries.google-workspace.settings.gws_bin /absolute/path/to/gws
+hermes plugins install anpicasso/hermes-google-workspace --ref v0.9.1 --enable
+hermes config set plugins.entries.gws-workspace.settings.gws_bin /absolute/path/to/gws
 ```
 
 Use `hermes --profile <name>` for another profile. Check the installer result for live reload; a fresh session may be needed for updated tools, and older frontends may require an external process reload.
@@ -29,7 +29,7 @@ hermes gws status person@example.com
 hermes gws logout person@example.com
 ```
 
-These local commands handle account directories and isolation automatically; native gws still performs OAuth. `gws` is resolved on PATH unless `plugins.entries.google-workspace.settings.gws_bin` sets an explicit executable. Setup/login/logout refuse active watches or pending cleanup. Setup requires `gcloud` and operator input in Cloud Console; skip it if this slot already has a Desktop client. Login writes in place: a failed or wrong-account attempt is blocked from routing, not rolled back.
+These local commands handle account directories and isolation automatically; native gws still performs OAuth. `gws` is resolved on PATH unless `plugins.entries.gws-workspace.settings.gws_bin` sets an explicit executable. Setup/login/logout refuse active watches or pending cleanup. Setup requires `gcloud` and operator input in Cloud Console; skip it if this slot already has a Desktop client. Login writes in place: a failed or wrong-account attempt is blocked from routing, not rolled back.
 
 Each account has a native configuration directory:
 
@@ -45,7 +45,7 @@ The optional [hermes-gws-remote-auth](https://github.com/anpicasso/hermes-gws-re
 
 ## Tools
 
-Load the bundled operational skill with `skill_view("google-workspace:workspace")`; it covers accounts, agent-driven watches and public HTTPS ingress options.
+Load the bundled operational skill with `skill_view("gws-workspace:workspace")`; it covers accounts, agent-driven watches and public HTTPS ingress options.
 
 The public plugin registers **18 tools**:
 
@@ -84,13 +84,15 @@ The operator provisions delivery routes and public HTTPS ingress; one separately
 
 ## Migration, security and removal
 
-Disable the old `gws-oauth` plugin before enabling this one; duplicate tool names must not coexist. Preserve account directories and stop/review existing watches before switching route configuration. Move operator settings to `plugins.entries.google-workspace.settings`; do not copy credentials into the installed plugin directory. The optional companion is installed separately if wanted.
+The plugin ID is now `gws-workspace` (toolset `gws_workspace`); the repository URL and account storage paths are unchanged. Before upgrading from our `gws-oauth` or pre-catalog v0.9.0 `google-workspace` build, stop watches, finish cleanup, stop the worker and disable that old installation; duplicate tool names must not coexist. Preserve account directories and move this plugin's settings and injection consent to `plugins.entries.gws-workspace`, then update the worker path and restart it. Do not copy credentials into the installed plugin directory. Update any explicit toolset allowlist and use remote-auth 0.1.1 or newer if wanted.
+
+The existing Hermes catalog entry named `google-workspace` belongs to another maintainer: do not overwrite its settings or treat it as this plugin's previous installation.
 
 Before removal, stop watches, allow remote cleanup, then stop the worker. Operator-provisioned Pub/Sub and Hermes routes are never deleted by this plugin. Removing the plugin does not remove credentials, watch state, or response files.
 
 ```bash
-hermes plugins disable google-workspace
-hermes plugins remove google-workspace
+hermes plugins disable gws-workspace
+hermes plugins remove gws-workspace
 ```
 
 [Security and catalog disclosure](docs/catalog-policy.md): external native credential ownership, content egress, account trust, filesystem and delivery limits. No catalog acceptance or endorsement is implied.

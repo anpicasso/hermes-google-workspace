@@ -148,7 +148,7 @@ class GatewayDispatchTests(unittest.TestCase):
         def dispatch(service="calendar", sid="physical"):
             args = {"calls": [{"name": f"gws_{service}_watch", "arguments": {"action": "status"}}]}
             def call():
-                return handle_function_call("tool_call", args, session_id=sid, enabled_toolsets=["google_workspace"])
+                return handle_function_call("tool_call", args, session_id=sid, enabled_toolsets=["gws_workspace"])
             return json.loads(asyncio.run(runner._run_in_executor_with_context(call)))
 
         def exercise():

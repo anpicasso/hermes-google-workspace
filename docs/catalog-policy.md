@@ -2,7 +2,7 @@
 
 ## Distribution and credential ownership
 
-`google-workspace` v0.9.0 is independently distributed. No Hermes catalog admission or Nous Research endorsement is claimed. Validation checks do not establish manual policy compliance. The policy reference is the [catalog admission rules](https://github.com/NousResearch/hermes-agent/blob/05348a3094a2356b9a271a2f22cdd6711c9952b8/plugin-catalog/README.md); admission requires review against the applicable rules.
+`gws-workspace` v0.9.1 is independently distributed. No Hermes catalog admission or Nous Research endorsement is claimed. Validation checks do not establish manual policy compliance. The policy reference is the [catalog admission rules](https://github.com/NousResearch/hermes-agent/blob/05348a3094a2356b9a271a2f22cdd6711c9952b8/plugin-catalog/README.md); admission requires review against the applicable rules.
 
 Native `gws`, not Python or Hermes' credential broker, owns Google credential storage, decryption and refresh. The public adapter selects an explicitly provisioned account directory and invokes short, locked native commands. It does not export OAuth credentials, refresh access tokens in Python, implement login, or register `gws_login`/`gws_logout`. The optional, separately distributed `hermes-gws-remote-auth` companion (`gws-remote-auth` plugin) is separately installed and is not required for public operation.
 

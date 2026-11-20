@@ -702,13 +702,13 @@ def profile_settings(home):
             config = yaml.safe_load(stream)
         if config is None:
             return {}
-        entry = config.get("plugins", {}).get("entries", {}).get("google-workspace", {})
+        entry = config.get("plugins", {}).get("entries", {}).get("gws-workspace", {})
         legacy, settings = entry.get("config", {}), entry.get("settings", {})
         if not isinstance(legacy, dict) or not isinstance(settings, dict):
             raise ValueError
         return {**legacy, **settings}
     except (OSError, ValueError, AttributeError, yaml.YAMLError):
-        raise ValueError("Invalid google-workspace profile configuration") from None
+        raise ValueError("Invalid gws-workspace profile configuration") from None
 
 
 def main(argv=None):

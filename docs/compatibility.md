@@ -1,6 +1,6 @@
 # Compatibility
 
-Runtime compatibility is not [catalog eligibility](catalog-policy.md). The public plugin is `google-workspace` v0.9.0; the optional `hermes-gws-remote-auth` companion is a separate installation.
+Runtime compatibility is not [catalog eligibility](catalog-policy.md). The public plugin is `gws-workspace` v0.9.1; the optional `hermes-gws-remote-auth` companion is a separate installation.
 
 ## Pinned baseline
 

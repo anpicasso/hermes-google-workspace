@@ -47,7 +47,7 @@ class HostIntegrationTests(unittest.TestCase):
                 return True
 
         fake_ctx = SimpleNamespace(
-            plugin_id="google-workspace",
+            plugin_id="gws-workspace",
             _manager=FakeManager(),
             _gateway_injection_allowed=lambda: True,
         )

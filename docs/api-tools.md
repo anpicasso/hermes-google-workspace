@@ -1,6 +1,6 @@
 # Workspace tools and approvals
 
-The public `google-workspace` v0.9.0 adapter leaves credentials and refresh to native `gws`. Start with [OAuth setup](oauth-setup.md) and [operator provisioning](login.md); see the [catalog disclosure](catalog-policy.md). The separate `hermes-gws-remote-auth` companion is optional, not a public runtime dependency.
+The public `gws-workspace` v0.9.1 adapter leaves credentials and refresh to native `gws`. Start with [OAuth setup](oauth-setup.md) and [operator provisioning](login.md); see the [catalog disclosure](catalog-policy.md). The separate `hermes-gws-remote-auth` companion is optional, not a public runtime dependency.
 
 One profile is one trusted operator. Every connected Google account belongs to that operator; every session authorized to use this profile can use those accounts. Choose an explicit `account` on every Workspace call. Use separate profiles and access controls for different operators.
 

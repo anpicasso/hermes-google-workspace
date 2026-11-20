@@ -44,7 +44,7 @@ and profile. Worker must construct RouteManager with the same config and profile
 ## Small operator configuration
 
 Place this object under a parent-selected plugin setting (recommended
-`plugins.entries.google-workspace.settings.watch_routes`). Do not put it in an
+`plugins.entries.gws-workspace.settings.watch_routes`). Do not put it in an
 installed snapshot or expose it through a model tool. Supply strong random secrets
 of at least 32 characters using the host's protected configuration/secrets setup.
 Values below are placeholders, not credentials.
@@ -100,7 +100,7 @@ implementation helpers or reads webhook_subscriptions.json. Operator requirement
   coalescing/scheduled execution that bypasses the hook. Use a fallback prompt
   saying this is an internal bridge, perform no actions, and reply NO_REPLY.
   Prompt text is defense in depth, not a substitute for the hook.
-- Enable the documented `plugins.entries.google-workspace.allow_gateway_injection:
+- Enable the documented `plugins.entries.gws-workspace.allow_gateway_injection:
   true` consent setting for same-session. No private consent-probe method is used;
   callable API availability is not proof of consent, and the injection return is
   authoritative for admission.

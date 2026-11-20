@@ -15,12 +15,15 @@ class WorkerConfigTests(unittest.TestCase):
             self.assertEqual(worker.profile_settings(home), {})
             path = home / "config.yaml"
             path.write_text(json.dumps({"plugins": {"entries": {"google-workspace": {
+                "settings": {"gws_bin": "unrelated-plugin"}}}}}))
+            self.assertEqual(worker.profile_settings(home), {})
+            path.write_text(json.dumps({"plugins": {"entries": {"gws-workspace": {
                 "config": {"gws_bin": "old", "watch_retention_days": 4},
                 "settings": {"gws_bin": "new"}}}}}))
             self.assertEqual(worker.profile_settings(home), {"gws_bin": "new", "watch_retention_days": 4})
-            for invalid in ("[]", "plugins: []", "plugins: {entries: {google-workspace: {settings: []}}}", "[bad"):
+            for invalid in ("[]", "plugins: []", "plugins: {entries: {gws-workspace: {settings: []}}}", "[bad"):
                 path.write_text(invalid)
-                with self.assertRaisesRegex(ValueError, "Invalid google-workspace"):
+                with self.assertRaisesRegex(ValueError, "Invalid gws-workspace"):
                     worker.profile_settings(home)
 
     def test_cli_overrides_and_routes_are_reread(self):
@@ -30,7 +33,7 @@ class WorkerConfigTests(unittest.TestCase):
                         "watch_reconcile_seconds": 42, "watch_retention_days": 3,
                         "watch_subscription_backoff_max": 80, "watch_routes": {"routes": []}}
             def save():
-                path.write_text(json.dumps({"plugins": {"entries": {"google-workspace": {"settings": settings}}}}))
+                path.write_text(json.dumps({"plugins": {"entries": {"gws-workspace": {"settings": settings}}}}))
             save()
             instance = mock.Mock(run_forever=mock.AsyncMock())
             with mock.patch.object(worker, "Worker", return_value=instance) as make, \

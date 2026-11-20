@@ -29,7 +29,7 @@ The optional `gws-remote-auth` companion supplies conversational login/logout an
 ## Verify and troubleshoot
 
 - `gws_accounts(check_health=true)` returns sanitized native validity and scope information. A slot label or stored file alone does not prove the Google identity; verify the native user matches and perform a bounded service read.
-- Missing CLI: install gws or configure `plugins.entries.google-workspace.settings.gws_bin` with its absolute executable path.
+- Missing CLI: install gws or configure `plugins.entries.gws-workspace.settings.gws_bin` with its absolute executable path.
 - Consent denied: check test users, audience, requested scopes and organization policy.
 - API denied after login: check API enablement and granted scopes. Reauthorization does not fix missing IAM.
 - Expired/revoked credentials: stop watches and complete cleanup before native reauthorization, or use the companion's guarded flow.

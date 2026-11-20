@@ -158,16 +158,16 @@ def register(ctx):
         return safe(handler)
 
     for name, schema in SCHEMAS.items():
-        ctx.register_tool(name=name, toolset="google_workspace",
+        ctx.register_tool(name=name, toolset="gws_workspace",
                           handler=workspace_handler(name), schema=schema)
 
-    ctx.register_tool(name="gws_accounts", toolset="google_workspace", handler=safe(accounts),
+    ctx.register_tool(name="gws_accounts", toolset="gws_workspace", handler=safe(accounts),
         schema={"name": "gws_accounts", "description": "List explicitly provisioned native gws account slots in this single-operator profile. Health returns sanitized native status, not credentials. A slot name is not proof of the Google identity. check_lifecycle is a read-only companion coordination contract, not authorization to delete credentials.",
                 "parameters": {"type": "object", "additionalProperties": False, "properties": {
                     "account": {"type": "string", "description": "Optional exact account; required for lifecycle check"},
                     "check_health": {"type": "boolean", "default": False},
                     "check_lifecycle": {"type": "boolean", "default": False}}, "required": []}})
-    ctx.register_tool(name="gws_api", toolset="google_workspace", handler=safe(api),
+    ctx.register_tool(name="gws_api", toolset="gws_workspace", handler=safe(api),
         schema={"name": "gws_api", "description": "Advanced native Workspace API for one explicit account. Prefer curated tools and gws_schema. Native auth lifecycle/export is blocked; provision accounts with operator-side hermes gws login. Mutations, sends/shares and local file input/output require Hermes approval. Pass CLI tokens, not shell text. Large successful output returns output_file/output_bytes; process locally and remove after use. Failures are sanitized.",
                 "parameters": {"type": "object", "additionalProperties": False, "properties": {
                     "account": {"type": "string"},
@@ -180,7 +180,7 @@ def register(ctx):
 
     for service, module in (("gmail", watch_gmail), ("drive", watch_drive),
                             ("calendar", watch_calendar)):
-        ctx.register_tool(name=module.TOOL_NAME, toolset="google_workspace",
+        ctx.register_tool(name=module.TOOL_NAME, toolset="gws_workspace",
                           handler=watch_handler(service), schema=module.tool_schema())
 
     ctx.register_hook("pre_gateway_dispatch", watch_tools.bridge_callback(runtime.store, ctx, runtime.routes, profile=profile))

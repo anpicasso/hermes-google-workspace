@@ -2,7 +2,7 @@
 
 ## Public adapter boundary
 
-`google-workspace` v0.9.0 is a native credential-owned adapter. `__init__.py` registers curated tools, `gws_api`, `gws_accounts`, three watch tools and public approval/dispatch hooks. It does not register login/logout tools or run a login manager. The optional `hermes-gws-remote-auth` companion is optional and separately installed; its login implementation is not the public execution path.
+`gws-workspace` v0.9.1 is a native credential-owned adapter. `__init__.py` registers curated tools, `gws_api`, `gws_accounts`, three watch tools and public approval/dispatch hooks. It does not register login/logout tools or run a login manager. The optional `hermes-gws-remote-auth` companion is optional and separately installed; its login implementation is not the public execution path.
 
 `router.py` selects `$HERMES_HOME/gws-oauth/accounts/<account>/` through `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`, sets the file keyring backend and invokes `[gws_bin, *args]` without a shell. Account paths/files reject unsafe links. A filtered subprocess environment, isolated native HOME and empty dotenv sentinel prevent accidental adoption of inherited tokens, global ADC or ancestor dotenv credentials. Python inspects account-file metadata; native `gws` owns credential contents, decryption and refresh.
 
@@ -24,7 +24,7 @@ Curated builders and the generic executor share `api_policy.py` and Hermes' appr
 - `watch_routes.py` maps an exact trusted origin to an operator-provisioned route. It stores only a config digest and non-secret per-watch metadata, not a native route. Sends use HMAC v2 over timestamp/body, stable request IDs, bounded receipts and no redirects. Removal forgets plugin metadata only; no private webhook imports or automatic route creation exist.
 - `watch_worker.py` is an explicitly supervised process. It owns Google subscription renewal/cleanup, loopback callback ingress, reconciliation, retries and forwarding, never starts during plugin registration or Doctor, and takes one POSIX worker lock per home.
 
-The worker's `--profile` defaults to `default`; `--home` identifies the exact home whose `config.yaml` supplies `plugins.entries.google-workspace.settings`. Explicit CLI values override startup settings. Route configuration is reread for each delivery; other configuration is loaded at startup and requires restart after edits. The gateway and worker must use the same home, profile and route contract. See [operator setup](watch-setup.md) for the exact `watch_routes: {routes: [...]}` shape.
+The worker's `--profile` defaults to `default`; `--home` identifies the exact home whose `config.yaml` supplies `plugins.entries.gws-workspace.settings`. Explicit CLI values override startup settings. Route configuration is reread for each delivery; other configuration is loaded at startup and requires restart after edits. The gateway and worker must use the same home, profile and route contract. See [operator setup](watch-setup.md) for the exact `watch_routes: {routes: [...]}` shape.
 
 A watch binds the selected route configuration, including its secret, by digest. A changed/disabled/missing configuration refuses delivery rather than retargeting. Stop and recreate watches after route changes. This checks the operator's attestation, not the remote receiver: the plugin has no public receiver readback API.
 

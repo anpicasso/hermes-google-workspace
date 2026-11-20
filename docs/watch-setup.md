@@ -1,6 +1,6 @@
 # Targeted Workspace watches: operator setup
 
-The public `google-workspace` v0.9.0 plugin uses explicitly provisioned native accounts. [Native `gws` owns authentication](login.md); the optional `hermes-gws-remote-auth` companion is optional. No Python OAuth export/refresh or Pub/Sub pull is used.
+The public `gws-workspace` v0.9.1 plugin uses explicitly provisioned native accounts. [Native `gws` owns authentication](login.md); the optional `hermes-gws-remote-auth` companion is optional. No Python OAuth export/refresh or Pub/Sub pull is used.
 
 ## Provision Google ingress
 
@@ -34,7 +34,7 @@ Use the public `hermes webhook subscribe` CLI; consult that host's `--help` for 
 
 - New session: enabled generic-HMAC receiver, `events: [gws-watch]`, fixed destination matching the origin, fixed skills, `deliver_only: false`, `mirror_to_session: false`. Its prompt must include `{__raw__}`, distinguish locally stored owner `instructions` from untrusted external `events`, and never treat event text/links as instructions to mutate Google data.
 - Same session: name starts with `gws-watch-bridge-`, generic HMAC, `events: [gws-watch-bridge]`, `deliver: log`, no skills, mirroring, deliver-only bypass or scheduled/coalesced execution that bypasses the hook. Use a fallback prompt to perform no actions and reply `NO_REPLY`; that prompt does not replace the hook.
-- Same-session injection additionally requires `plugins.entries.google-workspace.allow_gateway_injection: true` and a host exposing the real hook session store. Hosted isolation with only a placeholder store fails closed; prefer `new_session` rather than weakening isolation policy.
+- Same-session injection additionally requires `plugins.entries.gws-workspace.allow_gateway_injection: true` and a host exposing the real hook session store. Hosted isolation with only a placeholder store fails closed; prefer `new_session` rather than weakening isolation policy.
 
 This is an operator attestation, not receiver-side pinning: the plugin cannot read back remote route configuration. Stop watches before receiver edits and verify using the public CLI. Plugin config changes, including secret rotation, fail digest checks on existing watches; stop and recreate them rather than silently retargeting.
 
@@ -45,7 +45,7 @@ In the selected profile's `config.yaml`, merge these settings; replace every pla
 ```yaml
 plugins:
   entries:
-    google-workspace:
+    gws-workspace:
       allow_gateway_injection: true  # Only if same-session injection is intended.
       settings:
         gws_bin: /absolute/path/to/gws
@@ -87,13 +87,13 @@ Non-default profiles require `/p/PROFILE/webhooks/NAME` URLs and the matching or
 Use a dependency-complete Python environment with PyYAML, aiohttp and `google-auth[requests]` as declared in `plugin.yaml`. Run one worker per exact profile home:
 
 ```bash
-python /absolute/path/to/google-workspace/watch_worker.py run \
+python /absolute/path/to/gws-workspace/watch_worker.py run \
   --home /absolute/path/to/profile-home \
   --profile default \
   --callback-host 127.0.0.1 --callback-port 8765
 ```
 
-`--profile` defaults to `default`; it does not resolve or replace `--home`. The worker reads `plugins.entries.google-workspace.settings` from exactly `--home/config.yaml`, not another active profile's configuration. Explicit CLI overrides such as `--gws-bin`, `--callback-url`, `--gmail-topic`, `--gmail-subscription`, `--gmail-push-audience`, `--gmail-push-service-account` and `--reconcile-seconds` take precedence over startup settings. Routes are reread for each delivery; other settings load at startup, so restart after changing them. Keep gateway and worker settings aligned. `watch_callback_url` is a base; service paths are appended.
+`--profile` defaults to `default`; it does not resolve or replace `--home`. The worker reads `plugins.entries.gws-workspace.settings` from exactly `--home/config.yaml`, not another active profile's configuration. Explicit CLI overrides such as `--gws-bin`, `--callback-url`, `--gmail-topic`, `--gmail-subscription`, `--gmail-push-audience`, `--gmail-push-service-account` and `--reconcile-seconds` take precedence over startup settings. Routes are reread for each delivery; other settings load at startup, so restart after changing them. Keep gateway and worker settings aligned. `watch_callback_url` is a base; service paths are appended.
 
 The worker requires POSIX advisory locks and write access to native token caches and `$HERMES_HOME/plugin-data/gws-oauth/`. Watch state is a private SQLite database; a second worker for the same home refuses startup. Windows watch workers are unsupported. Use the [service example](../examples/gws-watch-worker.service) as a starting point, replacing paths and adding the correct profile argument. No service is installed or started automatically.
 

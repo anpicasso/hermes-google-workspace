@@ -68,7 +68,7 @@ def run(args, get_backend):
         print(json.dumps({"ok": False, "error": "Interrupted; incomplete native changes are not rolled back."}))
         return 130
     except FileNotFoundError:
-        result = {"ok": False, "error": "Missing native executable. Install gws on PATH or configure plugins.entries.google-workspace.settings.gws_bin."}
+        result = {"ok": False, "error": "Missing native executable. Install gws on PATH or configure plugins.entries.gws-workspace.settings.gws_bin."}
     except subprocess.TimeoutExpired:
         result = {"ok": False, "error": "Native gws timed out; incomplete native changes are not rolled back."}
     except AccountError as exc:

@@ -1,5 +1,9 @@
 # Installed verification
 
+## v0.9.1 namespace verification
+
+The plugin ID/config namespace is `gws-workspace` and its toolset is `gws_workspace`, avoiding the unrelated existing catalog entry. Repository URLs, native account directories and the backend contract are unchanged. The renamed public suite passed **229 tests, zero skipped**, including rejection of the unrelated `google-workspace` worker configuration; Validate and Doctor passed (18 tools, two hooks), with the existing documented scanner warnings. This namespace check does not repeat or extend the live Google consent/delivery evidence below.
+
 ## v0.9.0 release verification
 
 Runtime tested: `67d7d3bcab717ace38c30025aeef80b95dbb40f3`, native gws 0.22.5, Linux. The release preparation changes documentation only; no runtime or test code changes follow this live-tested revision.

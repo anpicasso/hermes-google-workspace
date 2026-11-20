@@ -1,6 +1,6 @@
 # Connect native accounts, then opt in to watches
 
-`google-workspace` delegates credential storage and refresh to native `gws`. It does not implement OAuth or automatically import global credentials. One Hermes profile belongs to one trusted operator; all authorized sessions in that profile can use its accounts.
+`gws-workspace` delegates credential storage and refresh to native `gws`. It does not implement OAuth or automatically import global credentials. One Hermes profile belongs to one trusted operator; all authorized sessions in that profile can use its accounts.
 
 ## Connect an account
 
