@@ -1,7 +1,6 @@
 """Local operator CLI: native gws owns OAuth, tokens and refresh throughout."""
 import argparse
 import json
-from pathlib import Path
 import subprocess
 
 from . import router as R
@@ -13,9 +12,10 @@ def setup_parser(parser):
     commands.add_parser("accounts", help="List this profile's native account slots")
     status = commands.add_parser("status", help="Check sanitized native account health")
     status.add_argument("account", type=_account)
+    commands.add_parser("setup", help="Run native Google Cloud and Desktop OAuth client setup").add_argument(
+        "account", type=_account)
     login = commands.add_parser("login", help="Run native browser consent for one account")
     login.add_argument("account", type=_account)
-    login.add_argument("--client-file", type=Path, help="Downloaded Desktop OAuth client JSON (not tokens)")
     scopes = login.add_mutually_exclusive_group()
     scopes.add_argument("--readonly", action="store_true", help="Native read-only scope preset")
     scopes.add_argument("--full", action="store_true", help="Native full scope preset, including cloud scopes")
@@ -31,26 +31,25 @@ def _account(value):
     return value.lower()
 
 
-def _login(backend, args, binary):
-    # Stage native login so cancellation, failure or wrong identity preserves the old slot.
-    epoch = backend.begin(args.account)
-    with backend.stage(args.account, args.client_file) as (staging, _):
-        argv = []
+def _auth(backend, args):
+    flags = []
+    if args.gws_action == "login":
         for flag in ("readonly", "full"):
             if getattr(args, flag):
-                argv.append("--" + flag)
+                flags.append("--" + flag)
         for flag in ("scopes", "services"):
             value = getattr(args, flag)
             if value is not None:
                 if not value.strip() or "\0" in value:
                     raise ValueError("Scope and service lists must be nonempty")
-                argv.extend(["--" + flag, value])
-        print("Complete native gws consent in this terminal/browser. Existing credentials stay unchanged until identity is verified.", flush=True)
-        with backend.login_process(staging, args.account, argv, binary=binary) as (command, env, cwd):
-            result = subprocess.run(command, env=env, cwd=cwd, timeout=600)
+                flags.extend(["--" + flag, value])
+    with backend.auth_process(args.account, args.gws_action, flags) as (command, options, verify):
+        print(f"Native gws {args.gws_action} for {args.account}: {options['env']['GOOGLE_WORKSPACE_CLI_CONFIG_DIR']}\n"
+              "The account is blocked until verified. Native changes cannot be rolled back.", flush=True)
+        result = subprocess.run(command, **options, timeout=600)
         if result.returncode:
-            return {"ok": False, "error": "Native login did not complete; existing account unchanged."}
-        return backend.activate(staging, args.account, binary=binary, epoch=epoch)
+            return {"ok": False, "error": "Native auth did not complete. Check its terminal instructions."}
+        return verify()
 
 
 def run(args, get_backend):
@@ -61,25 +60,27 @@ def run(args, get_backend):
             result = {"ok": True, "accounts": R.list_accounts(backend.root)}
         elif args.gws_action == "status":
             result = backend.status(args.account)
-        elif args.gws_action == "login":
-            result = _login(backend, args, backend.binary())
+        elif args.gws_action in ("login", "setup"):
+            result = _auth(backend, args)
         else:
             result = backend.logout(args.account)
     except KeyboardInterrupt:
-        print(json.dumps({"ok": False, "error": "Interrupted; incomplete login was not activated."}))
+        print(json.dumps({"ok": False, "error": "Interrupted; incomplete native changes are not rolled back."}))
         return 130
     except FileNotFoundError:
-        result = {"ok": False, "error": "Missing gws executable or Desktop client file. Configure plugins.entries.google-workspace.settings.gws_bin or supply --client-file."}
+        result = {"ok": False, "error": "Missing native executable. Install gws on PATH or configure plugins.entries.google-workspace.settings.gws_bin."}
     except subprocess.TimeoutExpired:
-        result = {"ok": False, "error": "Native gws timed out; incomplete login was not activated."}
+        result = {"ok": False, "error": "Native gws timed out; incomplete native changes are not rolled back."}
     except AccountError as exc:
         message = {"identity_mismatch": "The authorized Google identity does not match the requested account.",
+                   "unsupported_lock_backend": "Managed native auth requires POSIX process locks.",
                    "identity_unconfirmed": "Identity not confirmed. Include email/userinfo or a suitable Gmail scope.",
                    "credentials_in_use": "Stop this account's watches and finish cleanup before login/logout.",
-                   "client_missing": "Supply a Desktop client JSON with --client-file.",
-                   "client_invalid": "Supply a readable, unlinked Desktop OAuth client JSON.",
-                   "cancelled": "Account logout invalidated this login; credentials were not activated."}
+                   "logout_required": "Existing native token cache or plaintext fallback: explicitly log out before changing identity.",
+                   "setup_incomplete": "Native setup did not configure a Desktop client."}
         result = {"ok": False, "error_code": exc.reason, "error": message.get(exc.reason, "Account operation refused.")}
+    except TimeoutError:
+        result = {"ok": False, "error_code": "account_busy", "error": "Account lifecycle is busy; finish or cancel the active operation, then retry."}
     except (OSError, ValueError):
         result = {"ok": False, "error": "Account operation failed safely. Check account name, paths, permissions and Desktop client JSON."}
     except Exception:

@@ -45,40 +45,7 @@ def _open_lock(path):
 
 
 @contextmanager
-def _commit_lock(accounts, *, shared=False):
-    """Serialize account swaps across threads and processes.
-
-    Exclusive (default) is the profile-wide swap barrier used by OAuth installs.
-    Native reads take it *shared* and then a per-account lock, so different
-    accounts can run in parallel while an account swap still drains every reader
-    before it renames a credential directory.
-
-    ponytail: one profile-wide flock plus one lock per account; shard further only
-    if profile-wide shared-lock contention is measurable.
-    """
-    accounts = _safe_path(accounts)
-    accounts.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = _open_lock(accounts / ".lock")
-    try:
-        # Separate open descriptions serialize threads too. Never hold a Python
-        # mutex across blocking flock: another thread needs to release its fd.
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
-        elif msvcrt is not None:  # pragma: no cover - Windows
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
-        else:
-            raise OSError("No supported credential lock backend")
-        yield
-    finally:
-        # Closing also releases the OS lock, including on acquisition failure.
-        os.close(fd)
-
-
-@contextmanager
-def _account_lock(root, account):
+def _native_guard(root, account):
     """Cross-process lock for exactly one account, outside its credential dir."""
     if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
         raise ValueError("Invalid account name")
@@ -96,20 +63,10 @@ def _account_lock(root, account):
             msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
         else:
             raise OSError("No supported credential lock backend")
-        yield
+        # Even a native read may update its token cache after the supervisor dies.
+        yield (fd,) if fcntl is not None else ()
     finally:
         os.close(fd)
-
-
-@contextmanager
-def _native_guard(root, account):
-    """Shared swap barrier + one account lock for the whole native call."""
-    if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
-        raise ValueError("Invalid account name")
-    root = _safe_path(root)
-    with _commit_lock(root / "accounts", shared=True):
-        with _account_lock(root, account):
-            yield
 
 
 _ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}\Z")
@@ -129,15 +86,29 @@ _PERMISSION_MARKERS = (
 )
 
 
-def account_dir(root, account, *, require_credentials=True):
+_UNVERIFIED = ".hermes-unverified"
+
+
+class UnverifiedAccount(ValueError):
+    """A managed native mutation began but its identity has not been confirmed."""
+
+
+def account_dir(root, account, *, require_credentials=True, allow_unverified=False):
     if not isinstance(account, str) or not _ACCOUNT.fullmatch(account) or account in (".", ".."):
         raise ValueError("Invalid account name")
     path = _safe_path(Path(root) / "accounts" / account)
     if not path.is_dir():
         raise ValueError("Account is not registered in this profile")
+    if not allow_unverified:
+        try:
+            (path / _UNVERIFIED).lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise UnverifiedAccount("Account blocked until a successful verified login")
     # Inspect metadata only; native gws alone reads credentials, keys and caches.
     for name in ("credentials.enc", "credentials.json", ".encryption_key", "client_secret.json",
-                 "token_cache.json", "sa_token_cache.json"):
+                 "token_cache.json", "sa_token_cache.json", "credentials.tmp", _UNVERIFIED):
         entry = path / name
         if entry.is_symlink():
             raise ValueError("Refusing a symlinked native account file")
@@ -227,9 +198,9 @@ def native_command(root, slot, args, *, gws_bin):
         yield command, env, files_dir(root)
 
 
-def _run_gws(root, path, args, *, gws_bin, timeout):
+def _run_gws(root, path, args, *, gws_bin, timeout, **options):
     with native_command(root, path, args, gws_bin=gws_bin) as (command, env, cwd):
-        return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout, **options)
 
 
 def _failure(code, message, action, *, category, reauth_required, returncode, http_status=None):
@@ -359,9 +330,12 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
     reduced to fixed states and messages.
     """
     try:
-        with _native_guard(root, account):
+        with _native_guard(root, account) as pass_fds:
             path = account_dir(root, account)
-            result = _run_gws(root, path, ["auth", "status"], gws_bin=gws_bin, timeout=timeout)
+            result = _run_gws(root, path, ["auth", "status"], gws_bin=gws_bin, timeout=timeout, pass_fds=pass_fds)
+    except UnverifiedAccount:
+        return {"valid": False, "state": "unverified", "reauth_required": True,
+                "error_code": "identity_unconfirmed", "detail": _REAUTH}
     except subprocess.TimeoutExpired:
         return {"stored": True, "valid": None, "state": "stored", "reauth_required": False,
                 "detail": "gws auth status timed out; the session was not validated live."}
@@ -391,29 +365,21 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
 
 
 def account_identity(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
-    """Explicit pre-activation identity check, NOT an extra request per API call.
-
-    The backend verifies its isolated staging slot before taking the lifecycle
-    barrier for the final check and swap. Native auth status supplies `user` when userinfo scope is available. Otherwise only
-    Gmail getProfile-capable grants permit a fallback. Drive/Calendar-only
-    grants without userinfo cannot prove identity: provision with email scope
-    or an explicit trusted identity-binding flow; never treat a slot name or
-    token_valid as identity proof. No credential contents are read by Python.
-    """
+    """Verify the selected store under its native execution lock, without reading tokens."""
     unconfirmed = {"ok": False, "error_code": "identity_unconfirmed",
-                   "error": "Identity could not be verified; provision an identity-capable grant before activation."}
+                   "error": "Identity could not be verified; provision an identity-capable grant before routing."}
     mismatch = {"ok": False, "error_code": "identity_mismatch",
                 "error": "The authorized Google identity does not match this account."}
     deadline = time.monotonic() + timeout
     try:
-        with _native_guard(root, account):
-            path = account_dir(root, account)
+        with _native_guard(root, account) as pass_fds:
+            path = account_dir(root, account, allow_unverified=True)
 
             def read(args):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return {}
-                result = _run_gws(root, path, args, gws_bin=gws_bin, timeout=remaining)
+                result = _run_gws(root, path, args, gws_bin=gws_bin, timeout=remaining, pass_fds=pass_fds)
                 if result.returncode or len(result.stdout) > 200_000:
                     return {}
                 data = json.loads(result.stdout)
@@ -492,9 +458,11 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
                 "action": "use_gws_accounts_or_native_login", "reauth_required": False,
                 "error": "gws auth commands are not available to the agent; use gws_accounts with check_health=true. " + _REAUTH}
     try:
-        with _native_guard(root, account):
+        with _native_guard(root, account) as pass_fds:
             path = account_dir(root, account)
-            result = _run_gws(root, path, args, gws_bin=gws_bin, timeout=90)
+            result = _run_gws(root, path, args, gws_bin=gws_bin, timeout=90, pass_fds=pass_fds)
+    except UnverifiedAccount:
+        return {"ok": False, "error_code": "identity_unconfirmed", "error": _REAUTH}
     except (OSError, subprocess.TimeoutExpired):
         return {"ok": False, "error": "gws is unavailable or timed out"}
     if result.returncode:
@@ -540,12 +508,14 @@ def bounded_gws(root, account, args, *, gws_bin="gws", timeout=30, max_output=1_
         return {"ok": False, "error_code": "auth_blocked", "retryable": False,
                 "error": "Only native auth status is available to background readers."}
     try:
-        with _native_guard(root, account):
+        with _native_guard(root, account) as pass_fds:
             path = account_dir(root, account)
-            result = _run_gws(root, path, args, gws_bin=gws_bin, timeout=timeout)
+            result = _run_gws(root, path, args, gws_bin=gws_bin, timeout=timeout, pass_fds=pass_fds)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error_code": "timeout", "retryable": True,
                 "error": "The native call timed out; retry."}
+    except UnverifiedAccount:
+        return {"ok": False, "error_code": "identity_unconfirmed", "retryable": False, "error": _REAUTH}
     except (OSError, ValueError):
         return {"ok": False, "error_code": "transport_unavailable", "retryable": True,
                 "error": "gws is unavailable or the account does not belong to this profile."}

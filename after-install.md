@@ -4,8 +4,8 @@
 
 ## Connect an account
 
-1. Configure your own Google Cloud **Desktop OAuth client** and enable the APIs you need: [Google Cloud setup](docs/oauth-setup.md).
-2. Follow [native login and account selection](docs/login.md) to authorize each account in its explicit profile-scoped native configuration directory. Keep client files and credentials outside the plugin directory, with private permissions. Never paste client JSON or tokens into chat.
+1. Run `hermes gws setup EMAIL` in a terminal for the native gcloud wizard, or provision your own Google Cloud **Desktop OAuth client** and enable the APIs you need: [Google Cloud setup](docs/oauth-setup.md).
+2. Run `hermes gws login EMAIL` with the desired scopes. Follow [native login and account selection](docs/login.md) to authorize each account in its explicit profile-scoped native configuration directory. Keep client files and credentials outside the plugin directory, with private permissions. Never paste client JSON or tokens into chat.
 3. Start a fresh session to load the updated tool schemas. Use `gws_accounts(check_health=true)` to check native authentication; stored credentials alone do not prove a working session.
 
 Native `gws auth` is available in an operator terminal with the account configuration selected. Agent-facing `gws_api` intentionally refuses auth commands, including credential export. The optional **private** `gws-remote-auth` companion supplies `gws_login` and `gws_logout` for remote-browser authorization; those tools are not part of this public plugin. Stop watches and let remote cleanup finish before replacing or removing credentials. Local logout does not revoke Google consent.

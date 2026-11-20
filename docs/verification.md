@@ -18,7 +18,7 @@ The worker remains supervised; installation itself does not provision this infra
 
 ## Automated checks
 
-The historical installed runtime passed its own suites and CI. For the shared account backend, the public suite drives `hermes gws` with isolated native subprocesses. The matching private suite loads both actual plugins through the pinned Hermes loader and exercises configured off-PATH login, callback/session routing, cancellation, identity validation, watch refusal, local logout and CLI epoch fencing. These use synthetic identities and local loopback only, not Google or a platform adapter. See [compatibility](compatibility.md) for the reproducible host baseline.
+The historical installed runtime passed its own suites and CI. The public suite exercises local CLI dispatch, isolated native subprocesses, writer exclusion, and routing refusal after a wrong identity. The matching private suite loads both plugins through the Hermes loader and exercises an off-PATH binary, callback/session binding, cancellation, watch refusal and logout. Successful token exchange and identity lookup are simulated. An installed gws 0.22.5 is tested with synthetic inputs for the missing-gcloud setup error, consent URL generation followed by cancellation, and local logout. No Google account or external messaging platform is contacted in these tests. See [compatibility](compatibility.md) for the reproducible host baseline.
 
 ## What this does not prove
 

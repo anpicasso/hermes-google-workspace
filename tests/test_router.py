@@ -285,14 +285,14 @@ print(json.dumps({'token_valid': isolated, 'isolated': isolated, 'home': str(hom
     @unittest.skipIf(os.name != "posix", "POSIX symlink regression")
     def test_lock_symlinks_fail_closed(self):
         import hashlib
-        for part in ("swap_lock", "account_lock", "lock_dir"):
+        for part in ("account_lock", "lock_dir"):
             with self.subTest(part=part), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "profile"
                 slot = _account(root)
                 foreign = Path(tmp) / "foreign"
                 foreign.mkdir()
                 name = hashlib.sha256(slot.name.encode()).hexdigest()[:32]
-                target = {"swap_lock": slot.parent / ".lock", "lock_dir": root / ".locks",
+                target = {"lock_dir": root / ".locks",
                           "account_lock": root / ".locks" / f"{name}.lock"}[part]
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.symlink_to(foreign if part == "lock_dir" else foreign / "missing")
@@ -384,62 +384,42 @@ print(json.dumps({'token_valid': isolated, 'isolated': isolated, 'home': str(hom
             self.assertNotIn("private-details", str(result))
 
     @unittest.skipIf(os.name != "posix", "POSIX flock check")
-    def test_native_calls_and_other_processes_share_swap_lock(self):
-        import fcntl
-        import select
+    def test_native_calls_serialize_with_another_process_for_this_account(self):
         import subprocess
-        from router import _commit_lock
+        import select
+        from router import _native_guard
         with tempfile.TemporaryDirectory() as tmp:
-            _account(tmp)
-            accounts = Path(tmp) / "accounts"
-            def run_locked(*args, **kwargs):
-                with (accounts / ".lock").open("r+") as handle:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return mock.Mock(returncode=0, stdout='{"token_valid": true}', stderr="")
-            with mock.patch("router.subprocess.run", side_effect=run_locked):
-                self.assertTrue(execute_gws(tmp, "person@example.com", ["drive", "files", "list"])["ok"])
-                self.assertTrue(account_health(tmp, "person@example.com")["valid"])
-            code = ("from pathlib import Path\nfrom router import _commit_lock\n"
-                    "import sys\nprint('ready', flush=True)\n"
-                    "with _commit_lock(Path(sys.argv[1])):\n    print('acquired', flush=True)\n")
-            with _commit_lock(accounts):
-                proc = subprocess.Popen([sys.executable, "-c", code, str(accounts)],
+            slot = _account(tmp)
+            code = ("import sys\nfrom router import _native_guard\nprint('ready', flush=True)\n"
+                    "with _native_guard(sys.argv[1], sys.argv[2]): print('acquired', flush=True)")
+            with _native_guard(tmp, slot.name):
+                proc = subprocess.Popen([sys.executable, "-c", code, tmp, slot.name],
                     cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE, text=True)
                 assert proc.stdout is not None
                 self.assertEqual(proc.stdout.readline().strip(), "ready")
                 self.assertFalse(select.select([proc.stdout], [], [], 0.15)[0])
             out, _ = proc.communicate(timeout=5)
-            self.assertEqual(proc.returncode, 0)
-            self.assertEqual(out.strip(), "acquired")
+            self.assertEqual((proc.returncode, out.strip()), (0, "acquired"))
 
-    @unittest.skipIf(os.name != "posix", "POSIX threaded flock regression")
-    def test_waiting_swap_does_not_block_reader_release(self):
+    @unittest.skipIf(os.name != "posix", "POSIX flock check")
+    def test_inflight_native_reader_retains_lock_after_supervisor_exits(self):
+        import fcntl
         import subprocess
-        code = """
-import sys, threading, time
-from pathlib import Path
-from router import _commit_lock
-accounts = Path(sys.argv[1])
-waiting = threading.Event()
-acquired = threading.Event()
-def swap():
-    waiting.set()
-    with _commit_lock(accounts):
-        acquired.set()
-with _commit_lock(accounts, shared=True):
-    thread = threading.Thread(target=swap, daemon=True)
-    thread.start()
-    assert waiting.wait(1)
-    time.sleep(0.1)
-    assert not acquired.is_set()
-thread.join(2)
-assert acquired.is_set()
-"""
         with tempfile.TemporaryDirectory() as tmp:
-            result = subprocess.run([sys.executable, "-c", code, tmp], timeout=5,
-                                    cwd=Path(__file__).resolve().parents[1], capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+            slot = _account(tmp)
+            fake = _fake_gws(tmp, "import time; time.sleep(30)\n")
+
+            def leave_child_running(cmd, *, env, cwd, pass_fds=(), **kw):
+                proc = subprocess.Popen(cmd, env=env, cwd=cwd, pass_fds=pass_fds)
+                self.addCleanup(proc.wait, timeout=5)
+                self.addCleanup(proc.kill)
+                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+            with mock.patch("router.subprocess.run", side_effect=leave_child_running):
+                self.assertTrue(execute_gws(tmp, slot.name, ["drive", "files", "list"], gws_bin=str(fake))["ok"])
+            with next((Path(tmp) / ".locks").glob("*.lock")).open() as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_health_inconclusive_does_not_request_reauthorization(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,22 +16,11 @@ process it locally and remove it after use.
 
 ## Login
 
-Use local operator commands `hermes gws login EMAIL --client-file /path/to/desktop-client.json`,
-`hermes gws accounts`, `hermes gws status EMAIL` and `hermes gws logout EMAIL`.
-Login delegates to native gws; flags `--readonly`, `--full` or `--scopes` select
-consent scope, and `--services` filters the native picker. Never request broader
-access than needed. Without --client-file, reuse account then profile client config.
-The wrapper isolates account directories/HOME/environment, verifies identity before
-activation and preserves existing credentials if consent fails. Stop watches and
-finish cleanup before login/logout; the lifecycle guard refuses otherwise.
-For another profile use `hermes --profile NAME gws ...`. Binary selection is PATH
-by default or `plugins.entries.google-workspace.settings.gws_bin` in YAML.
-This is also the optional remote companion's binary setting; do not set a second one.
-Local logout clears native credentials and invalidates older staged logins; it does not revoke Google consent.
-Do not recommend global `gws auth login` as equivalent. These are terminal commands,
-not agent tools: use the optional private `gws_login`/`gws_logout` for conversational
-authorization. Never read/export tokens or intercept callbacks in the public plugin.
-See `docs/login.md` for native browser/remote-server limitations.
+Use `hermes gws setup EMAIL` for the native interactive wizard, then `hermes gws login EMAIL`, `hermes gws accounts`, `hermes gws status EMAIL`, or `hermes gws logout EMAIL`. Setup requires gcloud and may require Cloud Console client creation and terminal input. Skip setup if the slot already has a Desktop OAuth client. Do not import client files or global credentials. Account paths are selected automatically. Native options `--readonly`, `--full`, `--scopes` and `--services` control the login request; request only the access needed.
+
+Stop watches and finish cleanup before changing auth. Native changes happen in place: there is no rollback. Failed, interrupted and wrong-identity attempts block routing until verified login. If an old token cache or plaintext fallback exists, explicitly log out before replacement. Logout is local, not Google consent revocation. Use `hermes --profile NAME gws ...` for another profile. By default the binary is on PATH; the shared override is `plugins.entries.google-workspace.settings.gws_bin`.
+
+These are terminal commands. The optional private `gws_login`/`gws_logout` handle remote browser consent after client setup. The public plugin never intercepts callbacks or exports tokens. See `docs/login.md`.
 
 ## Agent-driven watches
 

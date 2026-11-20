@@ -18,7 +18,7 @@ The repository tests/CI pin Hermes commit `f7e2898aaefc8f967dbf7345e3999a65672fe
 
 There is no private webhook routing dependency or process-global origin fallback. The [route contract](routes-contract.md) records the inspected host seams and limits. A host without trusted physical-session binding cannot safely start watches. A hosted-isolation placeholder session store cannot support the same-session precheck; use `new_session` rather than weakening isolation. Callable injection alone does not prove consent or delivery.
 
-The watch worker requires POSIX advisory locking; Windows worker startup is unsupported. Use a dependency-complete Python environment and a separate worker for each exact profile home. Non-watch portability is not a claim of tested Windows support.
+The watch worker and managed native auth writes (setup, login and logout) require POSIX advisory locking; these operations are unsupported on Windows. Use a dependency-complete Python environment and a separate worker for each exact profile home. Non-watch portability is not a claim of tested Windows support.
 
 ## Verification scope
 

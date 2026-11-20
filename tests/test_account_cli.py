@@ -29,7 +29,10 @@ assert os.environ["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] == "file"
 assert not any(k in os.environ for k in ("GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_WORKSPACE_CLI_TOKEN", "CLOUDSDK_CONFIG"))
 assert Path(".env").read_bytes() == b""
 a = sys.argv[1:]
-if a[:2] == ["auth", "login"]:
+if a == ["auth", "setup"]:
+    (p / "client_secret.json").write_text(json.dumps({"installed": {"client_id":"ok", "client_secret":"fixture"}}))
+elif a[:2] == ["auth", "login"]:
+    if not (p / "client_secret.json").is_file(): sys.exit(2)
     client = json.loads((p / "client_secret.json").read_text())["installed"]
     mode = client["client_id"]
     (p / "credentials.enc").write_text("synthetic-new")
@@ -55,8 +58,6 @@ class AccountCliTests(unittest.TestCase):
         self.binary = self.base / "gws"
         self.binary.write_text("#!" + sys.executable + "\n" + FAKE)
         self.binary.chmod(0o700)
-        self.client = self.base / "client.json"
-        self.client.write_text(json.dumps({"installed": {"client_id": "ok", "client_secret": "synthetic"}}))
         self.parser = argparse.ArgumentParser()
         C.setup_parser(self.parser)
         self.used = False
@@ -71,7 +72,7 @@ class AccountCliTests(unittest.TestCase):
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def login(self, account="a@example.com"):
-        return self.invoke("login", account, "--client-file", str(self.client), "--readonly")
+        return self.invoke("login", account, "--readonly")
 
     def slot(self, account="a@example.com"):
         return self.root / "accounts" / account
@@ -81,6 +82,7 @@ class AccountCliTests(unittest.TestCase):
         (self.slot() / "credentials.enc").write_text("synthetic-old")
 
     def test_login_status_accounts_logout_real_children(self):
+        self.assertEqual(self.invoke("setup", "a@example.com")[0], 0)
         with patch.dict(os.environ, {"GOOGLE_WORKSPACE_CLI_TOKEN": "foreign", "GOOGLE_APPLICATION_CREDENTIALS": "foreign", "CLOUDSDK_CONFIG": "foreign"}):
             self.assertEqual(self.login()[0], 0)
             self.assertEqual(self.invoke("status", "A@example.com")[0], 0)
@@ -94,56 +96,70 @@ class AccountCliTests(unittest.TestCase):
 
     def test_path_lookup_and_explicit_binary_override(self):
         with patch.dict(os.environ, {"PATH": str(self.base)}):
-            self.assertEqual(self.invoke("login", "a@example.com", "--client-file", str(self.client), binary="gws")[0], 0)
+            self.assertEqual(self.invoke("setup", "a@example.com", binary="gws")[0], 0)
+            self.assertEqual(self.invoke("login", "a@example.com", binary="gws")[0], 0)
         with patch.dict(os.environ, {"PATH": ""}):
+            self.assertEqual(self.invoke("setup", "b@example.com")[0], 0)
             self.assertEqual(self.login("b@example.com")[0], 0)
         self.assertEqual(self.invoke("status", "a@example.com", binary="/missing/gws")[0], 1)
 
     def test_two_accounts_remain_independent(self):
+        for account in ("a@example.com", "b@example.com"):
+            self.assertEqual(self.invoke("setup", account)[0], 0)
         self.assertEqual(self.login()[0], 0)
         self.assertEqual(self.login("b@example.com")[0], 0)
         self.assertEqual(self.invoke("logout", "a@example.com")[0], 0)
         self.assertEqual(self.invoke("status", "b@example.com")[0], 0)
 
     def test_reauthorization_reuses_slot_client(self):
+        self.assertEqual(self.invoke("setup", "a@example.com")[0], 0)
         self.assertEqual(self.login()[0], 0)
-        self.client.unlink()
         self.assertEqual(self.invoke("login", "a@example.com", "--scopes", "email", "--services", "gmail")[0], 0)
         self.assertEqual(json.loads((self.slot() / "fake-argv.json").read_text()),
                          ["auth", "login", "--scopes", "email", "--services", "gmail"])
 
-    def test_profile_client_fallback(self):
+    def test_no_profile_client_fallback_or_legacy_store_cleanup(self):
         self.root.mkdir(parents=True)
-        (self.root / "client_secret.json").write_bytes(self.client.read_bytes())
-        self.assertEqual(self.invoke("login", "a@example.com", "--full")[0], 0)
+        (self.root / "client_secret.json").write_text("synthetic-profile-only")
+        legacy = self.root / ".pending/old"
+        legacy.mkdir(parents=True)
+        self.assertEqual(self.login()[0], 1)
+        self.assertFalse((self.slot() / "client_secret.json").exists())
+        self.assertTrue(legacy.is_dir())
 
-    def test_native_failure_and_wrong_identity_preserve_old_slot(self):
+    def test_wrong_identity_and_failed_in_place_reauth_block_all_routing(self):
         self.old()
         for mode in ("fail", "wrong"):
-            self.client.write_text(json.dumps({"installed": {"client_id": mode, "client_secret": "synthetic"}}))
+            (self.slot() / "client_secret.json").write_text(json.dumps({"installed": {"client_id": mode}}))
             self.assertEqual(self.login()[0], 1)
-            self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-old")
-            self.assertEqual(list((self.root / ".pending").glob("*.lease")), [])
+            self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-new")
+            self.assertEqual(self.invoke("accounts")[1]["accounts"], [])
+            with patch.object(C.R.subprocess, "run") as run:
+                for call in (C.R.execute_gws, C.R.bounded_gws):
+                    self.assertFalse(call(self.root, self.slot().name, ["drive", "files", "list"])["ok"])
+                run.assert_not_called()
+        self.assertEqual(self.invoke("logout", "a@example.com")[0], 0)
+        self.assertEqual(self.invoke("setup", "a@example.com")[0], 0)
+        self.assertEqual(self.login()[0], 0)
 
-    def test_interrupt_and_timeout_preserve_old_slot(self):
-        import subprocess
+    def test_interrupted_login_fails_closed_without_deleting_native_store(self):
         self.old()
-        for exc, code in ((KeyboardInterrupt(), 130), (subprocess.TimeoutExpired("gws", 1), 1)):
+        for exc, code in ((KeyboardInterrupt(), 130), (C.subprocess.TimeoutExpired("gws", 1), 1)):
             with patch.object(C.subprocess, "run", side_effect=exc):
                 self.assertEqual(self.login()[0], code)
-            self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-old")
-            self.assertEqual(list((self.root / ".pending").glob("*.lease")), [])
+            self.assertTrue((self.slot() / "credentials.enc").is_file())
+            self.assertEqual(self.invoke("accounts")[1]["accounts"], [])
 
-    def test_swap_failure_restores_old_slot(self):
+    def test_native_cache_and_plaintext_require_explicit_logout_before_replacement(self):
         self.old()
-        rename = os.rename
-        def fail(source, destination):
-            if ".pending" in Path(source).parts and Path(destination) == self.slot():
-                raise OSError("synthetic swap failure")
-            return rename(source, destination)
-        with patch.object(os, "rename", side_effect=fail):
-            self.assertEqual(self.login()[0], 1)
-        self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-old")
+        for name in ("credentials.json", "token_cache.json", "sa_token_cache.json"):
+            extra = self.slot() / name
+            extra.write_text("native-only")
+            for action in ("setup", "login"):
+                code, result = self.invoke(action, self.slot().name)
+                self.assertEqual((code, result["error_code"]), (1, "logout_required"))
+            self.assertEqual(extra.read_text(), "native-only")
+            extra.unlink()
 
     def test_logout_needs_native_success_and_credential_removal(self):
         self.old()
@@ -157,6 +173,16 @@ class AccountCliTests(unittest.TestCase):
                 self.assertEqual(result["state"], "logout_unconfirmed")
             self.assertTrue((self.slot() / "credentials.enc").exists())
 
+    def test_logout_does_not_claim_an_interrupted_native_temp_store_was_removed(self):
+        self.old()
+        residue = self.slot() / "credentials.tmp"
+        residue.write_text("synthetic")
+        code, result = self.invoke("logout", self.slot().name, binary="gws")
+        self.assertEqual((code, result["state"]), (1, "logout_unconfirmed"))
+        self.assertFalse((self.slot() / "credentials.enc").exists())
+        self.assertTrue(residue.exists())
+        self.assertFalse(self.invoke("accounts")[1]["accounts"])
+
     def test_busy_or_invalid_lifecycle_blocks_mutation(self):
         self.used = True
         for action in ("login", "logout"):
@@ -166,15 +192,50 @@ class AccountCliTests(unittest.TestCase):
         self.check = lambda args: {"ok": True, "credentials_in_use": False}
         self.assertEqual(self.login()[0], 1)
 
-    def test_invalid_clients_symlinks_and_unsafe_slot_fail(self):
-        self.client.write_text('{"refresh_token":"synthetic"}')
-        self.assertEqual(self.login()[0], 1)
-        self.client.unlink()
-        self.client.symlink_to(self.binary)
-        self.assertEqual(self.login()[0], 1)
-        self.slot().parent.mkdir(parents=True, exist_ok=True)
-        self.slot().symlink_to(self.base, target_is_directory=True)
-        self.assertEqual(self.login()[0], 1)
+    def test_unsafe_slot_and_client_symlink_fail_before_spawn(self):
+        self.slot().mkdir(parents=True)
+        (self.slot() / "client_secret.json").symlink_to(self.binary)
+        with patch.object(C.subprocess, "run") as run:
+            for action in ("setup", "login", "logout"):
+                self.assertEqual(self.invoke(action, self.slot().name)[0], 1)
+            run.assert_not_called()
+
+    def test_surviving_writer_keeps_the_fence_after_supervisor_releases_it(self):
+        import subprocess
+        backend = AccountBackend(self.root, lambda: str(self.binary), self.check)
+        self.binary.write_text("#!" + sys.executable + "\nimport time; time.sleep(30)\n")
+        with backend.auth_process("a@example.com", "login") as (cmd, options, _):
+            proc = subprocess.Popen(cmd, **options)
+        try:
+            # The parent no longer holds the lock. Its live child still does.
+            self.assertEqual(self.invoke("login", "a@example.com")[1]["error_code"], "account_busy")
+            self.assertFalse(backend.registered("a@example.com"))
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+        with backend.auth_process("a@example.com", "login"):
+            pass
+
+    def test_installed_gws_setup_reports_its_gcloud_prerequisite(self):
+        import shutil
+        binary = shutil.which("gws")
+        self.assertIsNotNone(binary, "install native gws for this check")
+        backend = AccountBackend(self.root, lambda: binary, self.check)
+        with patch.dict(os.environ, {"PATH": "", "CLOUDSDK_CONFIG": "foreign"}):
+            with backend.auth_process("a@example.com", "setup") as (cmd, options, _):
+                # No gcloud executable or network activity; exercise the native wizard's first check.
+                result = C.subprocess.run(cmd, **options, stdin=C.subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gcloud CLI not found", result.stderr + result.stdout)
+        self.assertFalse(backend.registered("a@example.com"))
+
+    def test_native_setup_offering_login_also_verifies_before_routing(self):
+        self.binary.write_text(self.binary.read_text().replace('elif a[:2] == ["auth", "login"]:',
+            '    a = ["auth", "login"]\nif a[:2] == ["auth", "login"]:').replace('else p.name', 'else "wrong@example.com"'))
+        code, result = self.invoke("setup", "a@example.com")
+        self.assertEqual((code, result["error_code"]), (1, "identity_mismatch"))
+        self.assertEqual(self.invoke("accounts")[1]["accounts"], [])
 
     def test_invalid_account_and_scope_combinations(self):
         for argv in (["login", "../bad"], ["login", "alias"], ["login", "a@example.com", "--full", "--readonly"], []):
@@ -194,7 +255,7 @@ class AccountCliTests(unittest.TestCase):
         C.register_cli(ctx, lambda: AccountBackend(self.root, lambda: str(self.binary), self.check))
         parser = argparse.ArgumentParser()
         _attach_plugin_cli_command(parser.add_subparsers(), descriptors)
-        args = parser.parse_args(["gws", "login", "a@example.com", "--client-file", str(self.client), "--readonly"])
+        args = parser.parse_args(["gws", "setup", "a@example.com"])
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
             args.func(args)
         self.assertEqual(exit.exception.code, 0)

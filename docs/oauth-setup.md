@@ -1,6 +1,6 @@
 # Google Cloud OAuth setup
 
-The public adapter uses native **gws authentication**, not Hermes-managed OAuth. You need your own **Google Cloud OAuth client of type Desktop app**. An API key or service-account JSON is not a substitute. `gcloud` is optional; the Cloud Console is sufficient.
+The public adapter uses native **gws authentication**, not Hermes-managed OAuth. You need your own **Google Cloud OAuth client of type Desktop app**. An API key or service-account JSON is not a substitute. `hermes gws setup EMAIL` launches the native interactive wizard and requires `gcloud`; if you provision a Desktop client yourself, native login does not require `gcloud`.
 
 ## Create a client
 
@@ -16,15 +16,15 @@ References: [create credentials](https://developers.google.com/workspace/guides/
 
 ## Store the downloaded client
 
-Use `<actual Hermes profile home>/gws-oauth/accounts/<lowercase-account>/client_secret.json`. The legacy `gws-oauth` data directory is deliberately retained during the plugin rename. Set user-only permissions (directory 0700/file 0600 on POSIX); use real directories and regular files, not symlinks/hardlinks. Keep credentials outside the installed plugin snapshot.
+Use `<actual Hermes profile home>/gws-oauth/accounts/<lowercase-account>/client_secret.json`. This stable directory is created automatically by the account wrapper. Set user-only permissions (directory 0700/file 0600 on POSIX); use real directories and regular files, not symlinks/hardlinks. Keep credentials outside the installed plugin snapshot.
 
 The public adapter selects that store using `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`; gws owns its credentials, key and token cache. It does not copy a global/profile client or adopt the globally logged-in account. Provision each account explicitly using the complete [native login/logout instructions](login.md).
 
 ## Native auth and optional companion
 
-`gws auth setup` can assist setup when `gcloud` is configured. Native `gws auth login`, `status` and `logout` remain available to the operator in the selected store. The agent-facing `gws_api` blocks the auth namespace, especially export; that does not ban terminal use.
+`hermes gws setup EMAIL` runs the native wizard, which can sign into gcloud, create/select a project, enable APIs, and prompt for the Desktop client ID and secret from Cloud Console. Enter those only in the local native terminal. The wizard may also offer login; its result is checked before routing. With an existing native client in this slot, skip the wizard and run `hermes gws login EMAIL`.
 
-The optional private `gws-remote-auth` companion supplies conversational login/logout and cross-device callbacks. Its profile/global client lookup is documented in that repository, not a fallback in this public adapter. The public plugin works without it. Neither plugin creates your Cloud project or consent screen. Never paste client JSON, exported credentials or tokens into chat.
+The optional private `gws-remote-auth` companion supplies conversational login/logout and cross-device callbacks **after** the same native setup. It has no profile/global client fallback. The public plugin works without it. Never paste client JSON, exported credentials or tokens into chat.
 
 ## Verify and troubleshoot
 

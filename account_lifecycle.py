@@ -5,13 +5,13 @@ lifecycle_guard(root, account) uses root/.locks/<digest>.lifecycle.lock, where
 Account spelling is exact, matching router execution locks; callers that store
 lowercase accounts must pass the canonical lowercase slot name to BOTH plugins.
 root is the shared gws-oauth root, NOT the accounts directory or a slot.
-Never unlink/replace lock files: the inode must survive logout/reauth swaps.
+Never unlink/replace lock files: the inode must survive native auth changes.
 
 Public watch start holds this guard across validation and durable registration.
-Native logout/activation holds it across the public nonsecret watch-status query
-and the credential commit/removal. The status query itself MUST NOT acquire
+Native setup/login/logout holds it across the watch check and the whole native
+operation, including consent and identity verification. The status query itself MUST NOT acquire
 this guard (the querying process already holds it). No SQLite internals needed.
-Always acquire lifecycle BEFORE router swap/execution locks or store transactions.
+Always acquire lifecycle BEFORE native execution locks or store transactions.
 Never acquire lifecycle from inside a native call. This lock is non-reentrant.
 
 POSIX flock and Windows first-byte locking match router's OS primitives.
@@ -43,7 +43,7 @@ _LOCK_TIMEOUT = 10.0
 
 
 @contextmanager
-def lifecycle_guard(root, account):
+def lifecycle_guard(root, account, *, wait=True):
     """Fence one account's lifecycle; raises TimeoutError/OSError/ValueError."""
     if not isinstance(account, str) or not _ACCOUNT.fullmatch(account):
         raise ValueError("Invalid account name")
@@ -77,9 +77,9 @@ def lifecycle_guard(root, account):
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                     raise
-                if time.monotonic() >= deadline:
+                if not wait or time.monotonic() >= deadline:
                     raise TimeoutError("Account lifecycle is busy; retry later") from None
                 time.sleep(0.05)
-        yield
+        yield fd
     finally:
         os.close(fd)
