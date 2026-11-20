@@ -108,7 +108,7 @@ def register(ctx):
 
         def origin(self, session_id=None):
             root()
-            return current_origin(session_id, profile)
+            return current_origin(session_id, profile, home=home)
 
     runtime = Runtime()
     ctx.register_skill("workspace", Path(__file__).parent / "skills/workspace/SKILL.md")

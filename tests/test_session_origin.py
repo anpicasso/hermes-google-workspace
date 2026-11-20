@@ -1,9 +1,13 @@
-"""Exercise the real host ContextVars with synthetic routes, not live delivery."""
+"""Exercise real host context binding and watch dispatch without live delivery."""
+import asyncio
 import contextvars
+import json
 import os
 import sys
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -104,6 +108,74 @@ class OriginTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"gateway.session_context": None}):
             with self.assertRaises(WatchError):
                 self.origin()
+
+
+class GatewayDispatchTests(unittest.TestCase):
+    def test_primary_profile_watch_status_through_tool_call(self):
+        from gateway.config import GatewayConfig, Platform
+        from gateway.platforms.event import MessageEvent
+        from gateway.session import SessionEntry, SessionSource, build_session_context
+        from gateway.session_identity import clear_identity
+        from hermes_cli.plugins_manifest import parse_manifest_file
+
+        repo = Path(__file__).resolve().parents[1]
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": tmp, "HERMES_HOME": str(Path(tmp) / ".hermes"), "HERMES_DISABLE_LAZY_INSTALLS": "1",
+        }))
+        from gateway.run import GatewayRunner
+        from hermes_cli.plugins import get_plugin_manager
+        from hermes_cli.profiles import get_active_profile_name
+        from model_tools import handle_function_call
+
+        manager = get_plugin_manager()
+        manifest = parse_manifest_file(repo / "plugin.yaml", repo, "user", "")
+        assert manifest is not None
+        manager._load_plugin(manifest)
+        self.addCleanup(manager.unload, manifest)
+        runner = GatewayRunner.__new__(GatewayRunner)  # No credentials or listeners.
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        profile = runner._primary_profile_name = get_active_profile_name()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="actor")
+        identity = runner._canonicalize(source)
+        assert identity is not None
+        self.assertEqual(identity.runtime_profile, profile)
+        self.assertIsNone(source.profile)
+        event = MessageEvent(text="status", source=source, user_id="actor")
+        now = datetime.now(timezone.utc)
+        entry = SessionEntry(runner._session_key_for_source(source), "physical", now, now)
+
+        def dispatch(service="calendar", sid="physical"):
+            args = {"calls": [{"name": f"gws_{service}_watch", "arguments": {"action": "status"}}]}
+            def call():
+                return handle_function_call("tool_call", args, session_id=sid, enabled_toolsets=["google_workspace"])
+            return json.loads(asyncio.run(runner._run_in_executor_with_context(call)))
+
+        def exercise():
+            with runner._session_env_scope(build_session_context(source, runner.config, entry, event)):
+                self.assertEqual(S._bound_session_value("HERMES_SESSION_PROFILE"), "")
+                for service in ("gmail", "drive", "calendar"):
+                    result = dispatch(service)
+                    self.assertTrue(result.get("ok"), result)
+                    self.assertEqual(result["watches"], [])
+                self.assertEqual(dispatch(sid="other")["error_code"], "no_trusted_origin")
+                with delegated_child_context("child"):
+                    self.assertEqual(dispatch(sid="child")["error_code"], "no_trusted_origin")
+                clear_identity(source)
+                self.assertEqual(dispatch()["error_code"], "no_trusted_origin")
+                runner._canonicalize(source, primary_home=Path(tmp) / "other-home")
+                self.assertEqual(dispatch()["error_code"], "no_trusted_origin")
+                clear_identity(source)
+                runner._primary_profile_name = "foreign"
+                runner._canonicalize(source)
+                self.assertEqual(dispatch()["error_code"], "no_trusted_origin")
+                clear_identity(source)
+                runner._primary_profile_name = profile
+                runner._canonicalize(source)
+                event.absorb_turn_input(MessageEvent(text="another sender", user_id="other"))
+                self.assertEqual(dispatch()["error_code"], "no_trusted_origin")
+
+        contextvars.Context().run(exercise)
 
 
 if __name__ == "__main__":

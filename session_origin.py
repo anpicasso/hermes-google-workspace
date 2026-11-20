@@ -20,7 +20,7 @@ def _text(value, *, optional=False):
     return value
 
 
-def current_origin(session_id, profile):
+def current_origin(session_id, profile, *, home=None):
     """Snapshot this tool call's origin; no manual bind or model destination.
 
     A child's physical ID can be rebound while retaining its parent's route.
@@ -28,7 +28,8 @@ def current_origin(session_id, profile):
     """
     try:
         from agent.delegation_context import is_delegated_child_process_context
-        from gateway.session_context import _bound_session_value
+        from gateway.session_context import _bound_session_value, _SESSION_TURN_EVENT
+        from gateway.session_identity import identity_of
     except ImportError:
         raise WatchError("no_trusted_origin", "This Hermes host lacks the required bound-context adapter") from None
     if is_delegated_child_process_context():
@@ -39,7 +40,15 @@ def current_origin(session_id, profile):
     def bound(field, *, optional=False):
         return _text(_bound_session_value("HERMES_SESSION_" + field), optional=optional)
 
-    if bound("ID") != sid or bound("PROFILE") != profile:
+    session_profile = _bound_session_value("HERMES_SESSION_PROFILE")
+    if session_profile == "":
+        # The primary gateway route has no wire profile. Only its pinned turn
+        # identity can supply one; an unset ContextVar is not a primary route.
+        identity = identity_of(getattr(_SESSION_TURN_EVENT.get(), "source", None))
+        if identity is None or identity.runtime_home.resolve() != home:
+            raise WatchError("no_trusted_origin", "No matching gateway profile identity is bound to this turn")
+        session_profile = identity.runtime_profile
+    if bound("ID") != sid or _text(session_profile) != profile:
         raise WatchError("no_trusted_origin", "Tool session or profile does not match its runtime origin")
     platform = bound("PLATFORM")
     if platform in {"webhook", "msgraph_webhook", "api", "api_server", "cron",
