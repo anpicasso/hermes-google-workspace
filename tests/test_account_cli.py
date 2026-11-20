@@ -13,10 +13,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("gws_cli_test", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
+assert spec is not None and spec.loader is not None
 plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
-from gws_cli_test import account_cli as C
+C = importlib.import_module(spec.name + ".account_cli")
+AccountBackend = importlib.import_module(spec.name + ".account_backend").AccountBackend
 
 FAKE = '''import json, os, sys
 from pathlib import Path
@@ -64,8 +66,8 @@ class AccountCliTests(unittest.TestCase):
     def invoke(self, *argv, binary=None, root=None):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = C.run(self.parser.parse_args(argv), root=root or (lambda: self.root),
-                         gws_bin=lambda: str(binary or self.binary), check_lifecycle=self.check)
+            code = C.run(self.parser.parse_args(argv), lambda: AccountBackend(
+                root() if root else self.root, lambda: str(binary or self.binary), self.check))
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def login(self, account="a@example.com"):
@@ -121,32 +123,44 @@ class AccountCliTests(unittest.TestCase):
             self.client.write_text(json.dumps({"installed": {"client_id": mode, "client_secret": "synthetic"}}))
             self.assertEqual(self.login()[0], 1)
             self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-old")
-            self.assertEqual(list(self.root.glob(".native-login-*")), [])
+            self.assertEqual(list((self.root / ".pending").glob("*.lease")), [])
 
     def test_interrupt_and_timeout_preserve_old_slot(self):
         import subprocess
         self.old()
         for exc, code in ((KeyboardInterrupt(), 130), (subprocess.TimeoutExpired("gws", 1), 1)):
-            with patch.object(C.R, "_run_gws", side_effect=exc):
+            with patch.object(C.subprocess, "run", side_effect=exc):
                 self.assertEqual(self.login()[0], code)
             self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-old")
-            self.assertEqual(list(self.root.glob(".native-login-*")), [])
+            self.assertEqual(list((self.root / ".pending").glob("*.lease")), [])
 
     def test_swap_failure_restores_old_slot(self):
         self.old()
         rename = os.rename
         def fail(source, destination):
-            if ".native-login-" in str(source) and Path(destination) == self.slot():
+            if ".pending" in Path(source).parts and Path(destination) == self.slot():
                 raise OSError("synthetic swap failure")
             return rename(source, destination)
-        with patch.object(C.os, "rename", side_effect=fail):
+        with patch.object(os, "rename", side_effect=fail):
             self.assertEqual(self.login()[0], 1)
         self.assertEqual((self.slot() / "credentials.enc").read_text(), "synthetic-old")
+
+    def test_logout_needs_native_success_and_credential_removal(self):
+        self.old()
+        for status in (2, 0):
+            self.binary.write_text("#!" + sys.executable + "\nprint('private-fixture-output')\nraise SystemExit(%d)\n" % status)
+            code, result = self.invoke("logout", "a@example.com")
+            self.assertEqual(code, 1)
+            self.assertFalse(result["ok"])
+            self.assertNotIn("private-fixture-output", json.dumps(result))
+            if not status:
+                self.assertEqual(result["state"], "logout_unconfirmed")
+            self.assertTrue((self.slot() / "credentials.enc").exists())
 
     def test_busy_or_invalid_lifecycle_blocks_mutation(self):
         self.used = True
         for action in ("login", "logout"):
-            with patch.object(C.R, "_run_gws") as native:
+            with patch.object(C.subprocess, "run") as native:
                 self.assertEqual(self.invoke(action, "a@example.com")[0], 1)
                 native.assert_not_called()
         self.check = lambda args: {"ok": True, "credentials_in_use": False}
@@ -177,7 +191,7 @@ class AccountCliTests(unittest.TestCase):
         descriptors = {}
         ctx = SimpleNamespace(get_config=lambda key, default=None: str(self.binary),
             register_cli_command=lambda name, **kw: descriptors.update(name=name, **kw))
-        C.register_cli(ctx, lambda: self.root, self.check)
+        C.register_cli(ctx, lambda: AccountBackend(self.root, lambda: str(self.binary), self.check))
         parser = argparse.ArgumentParser()
         _attach_plugin_cli_command(parser.add_subparsers(), descriptors)
         args = parser.parse_args(["gws", "login", "a@example.com", "--client-file", str(self.client), "--readonly"])
@@ -189,7 +203,7 @@ class AccountCliTests(unittest.TestCase):
     def test_profile_guard_fails_closed(self):
         def wrong_profile():
             raise RuntimeError("wrong profile")
-        with patch.object(C.R, "_run_gws") as native:
+        with patch.object(C.subprocess, "run") as native:
             self.assertEqual(self.invoke("login", "a@example.com", root=wrong_profile)[0], 1)
             native.assert_not_called()
 

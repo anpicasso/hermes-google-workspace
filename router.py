@@ -116,8 +116,7 @@ _ACCOUNT = re.compile(r"[A-Za-z0-9][A-Za-z0-9@._+-]{0,127}\Z")
 _HTTP_STATUS = re.compile(r'"code"\s*:\s*(\d{3})')
 _HTTP_STATUS_ANY = re.compile(r'(?:\bHTTP[ /]|\bstatus[=: ]{1,3})(\d{3})\b', re.IGNORECASE)
 _HEALTH_TIMEOUT = 20
-_REAUTH = ("Run gws auth login with this account's GOOGLE_WORKSPACE_CLI_CONFIG_DIR "
-           "and the file keyring backend.")
+_REAUTH = "Run hermes gws login <account> in a terminal for this profile."
 # Scope URLs/names only; anything else in the status payload is never echoed.
 _SCOPE = re.compile(r"(?:https://www\.googleapis\.com/auth/[A-Za-z0-9._/-]{1,120}|openid|email|profile)\Z")
 
@@ -130,7 +129,7 @@ _PERMISSION_MARKERS = (
 )
 
 
-def account_dir(root, account):
+def account_dir(root, account, *, require_credentials=True):
     if not isinstance(account, str) or not _ACCOUNT.fullmatch(account) or account in (".", ".."):
         raise ValueError("Invalid account name")
     path = _safe_path(Path(root) / "accounts" / account)
@@ -146,7 +145,7 @@ def account_dir(root, account):
             info = entry.stat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError("Refusing an unsafe native account file")
-    if not any((path / name).is_file() for name in ("credentials.enc", "credentials.json")):
+    if require_credentials and not any((path / name).is_file() for name in ("credentials.enc", "credentials.json")):
         raise ValueError("Account is not registered in this profile")
     return path
 
@@ -212,17 +211,25 @@ def _account_env(path):
         yield env
 
 
-def _run_gws(root, path, args, *, gws_bin, timeout, capture_output=True):
-    """Caller holds _native_guard. Resolve the CLI before changing child CWD."""
-    binary = shutil.which(os.fspath(gws_bin))
+def resolve_binary(value):
+    """Resolve before changing child CWD; preserve executable symlink/wrapper semantics."""
+    binary = shutil.which(os.fspath(value)) if isinstance(value, (str, os.PathLike)) and value else None
     if binary is None:
-        raise FileNotFoundError("gws executable not found")
-    # absolute(), not resolve(): retain executable symlink/wrapper semantics.
-    with _account_env(path) as env:
-        return subprocess.run(
-            [str(Path(binary).absolute()), *args], env=env, cwd=files_dir(root),
-            capture_output=capture_output, text=True, timeout=timeout,
-        )
+        raise FileNotFoundError("Configured gws executable not found")
+    return str(Path(binary).absolute())
+
+
+@contextmanager
+def native_command(root, slot, args, *, gws_bin):
+    """Caller owns native locks and the lifetime of the process inside this scope."""
+    command = [resolve_binary(gws_bin), *args]
+    with _account_env(slot) as env:
+        yield command, env, files_dir(root)
+
+
+def _run_gws(root, path, args, *, gws_bin, timeout):
+    with native_command(root, path, args, gws_bin=gws_bin) as (command, env, cwd):
+        return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
 def _failure(code, message, action, *, category, reauth_required, returncode, http_status=None):
@@ -386,8 +393,8 @@ def account_health(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
 def account_identity(root, account, *, gws_bin="gws", timeout=_HEALTH_TIMEOUT):
     """Explicit pre-activation identity check, NOT an extra request per API call.
 
-    Caller holds lifecycle_guard through this check and activation. Native auth
-    status supplies `user` when userinfo scope is available. Otherwise only
+    The backend verifies its isolated staging slot before taking the lifecycle
+    barrier for the final check and swap. Native auth status supplies `user` when userinfo scope is available. Otherwise only
     Gmail getProfile-capable grants permit a fallback. Drive/Calendar-only
     grants without userinfo cannot prove identity: provision with email scope
     or an explicit trusted identity-binding flow; never treat a slot name or

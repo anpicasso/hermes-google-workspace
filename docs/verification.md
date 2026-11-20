@@ -1,6 +1,6 @@
 # Installed verification
 
-Runtime tested: `5e7ffc29774b5d1ee664e3a8e4603cd5081cf124` (0.9.0), native gws 0.22.5, Linux. Later documentation-only commits do not change this runtime.
+Runtime tested: `5e7ffc29774b5d1ee664e3a8e4603cd5081cf124` (0.9.0), native gws 0.22.5, Linux. The installed check below predates the shared native account backend.
 
 ## Real Google PUSH → Hermes → Discord
 
@@ -18,7 +18,7 @@ The worker remains supervised; installation itself does not provision this infra
 
 ## Automated checks
 
-The public suite passed 207 tests; the private companion suite passed 69 tests. Native host validation/doctor and joint registration checks were exercised separately. CI also passed for the runtime commit above.
+The historical installed runtime passed its own suites and CI. For the shared account backend, the public suite drives `hermes gws` with isolated native subprocesses. The matching private suite loads both actual plugins through the pinned Hermes loader and exercises configured off-PATH login, callback/session routing, cancellation, identity validation, watch refusal, local logout and CLI epoch fencing. These use synthetic identities and local loopback only, not Google or a platform adapter. See [compatibility](compatibility.md) for the reproducible host baseline.
 
 ## What this does not prove
 

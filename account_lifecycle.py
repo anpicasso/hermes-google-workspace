@@ -1,4 +1,4 @@
-"""Shared public/private account lifecycle protocol (v1); stdlib-only, vendorable.
+"""Shared account lifecycle barrier used by the native account backend and watches.
 
 lifecycle_guard(root, account) uses root/.locks/<digest>.lifecycle.lock, where
 <digest> is the first 32 lowercase hex characters of SHA256(account UTF-8).
@@ -8,7 +8,7 @@ root is the shared gws-oauth root, NOT the accounts directory or a slot.
 Never unlink/replace lock files: the inode must survive logout/reauth swaps.
 
 Public watch start holds this guard across validation and durable registration.
-Private logout/reauth holds it across the public nonsecret watch-status query
+Native logout/activation holds it across the public nonsecret watch-status query
 and the credential commit/removal. The status query itself MUST NOT acquire
 this guard (the querying process already holds it). No SQLite internals needed.
 Always acquire lifecycle BEFORE router swap/execution locks or store transactions.

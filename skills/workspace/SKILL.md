@@ -26,6 +26,8 @@ activation and preserves existing credentials if consent fails. Stop watches and
 finish cleanup before login/logout; the lifecycle guard refuses otherwise.
 For another profile use `hermes --profile NAME gws ...`. Binary selection is PATH
 by default or `plugins.entries.google-workspace.settings.gws_bin` in YAML.
+This is also the optional remote companion's binary setting; do not set a second one.
+Local logout clears native credentials and invalidates older staged logins; it does not revoke Google consent.
 Do not recommend global `gws auth login` as equivalent. These are terminal commands,
 not agent tools: use the optional private `gws_login`/`gws_logout` for conversational
 authorization. Never read/export tokens or intercept callbacks in the public plugin.

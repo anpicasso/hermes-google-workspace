@@ -39,7 +39,7 @@ Native login is interactive: complete it in a terminal with an appropriate brows
 
 ## Binary resolution
 
-By default the plugin resolves `gws` on PATH. An explicit setting takes precedence for the CLI, tools and worker:
+By default the plugin resolves `gws` on PATH. An explicit public setting selects the executable for the account CLI, compatible remote companion, tools and worker by default:
 
 ```yaml
 plugins:
@@ -53,6 +53,8 @@ An explicitly configured missing/non-executable binary fails; it does not silent
 
 ## Recovery and boundaries
 
-Normal login errors roll back without replacing the old slot. A process/host crash can leave a hidden `.native-login-*` staging directory or `.backup-*` account directory: inspect these locally with no auth process running before cleanup; never copy token/cache/key files between identities. Backups are retained if cleanup fails. Same-user malicious filesystem replacement is not a supported isolation boundary.
+Normal login errors roll back without replacing the old slot. A crashed login can leave a leased directory under `.pending/`. On POSIX the next login sweeps abandoned leases without touching live ones; on Windows cleanup is owner-only. Interrupted swaps can leave an `accounts/.<account>.backup-*` directory: inspect it locally with no auth process running before cleanup; never copy token/cache/key files between identities. Backups are retained if cleanup fails. Same-user malicious filesystem replacement is not a supported isolation boundary.
+
+Local logout also prevents pending logins begun before that logout from reactivating the slot. The optional private companion uses the registered `gws-native-account-v1` instance in the same profile; it has no separate binary setting or credential-store implementation.
 
 The private `gws-remote-auth` companion supplies conversational `gws_login` start/status/cancel and approval-gated `gws_logout`; it is optional and separately installed. This public CLI is operator-side only, not a new agent tool or gateway slash command. `gws_api` still blocks native auth/export. Do not enable the old combined `gws-oauth` plugin alongside this plugin because tool names collide.

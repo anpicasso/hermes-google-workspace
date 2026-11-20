@@ -38,7 +38,7 @@ $HERMES_HOME/gws-oauth/accounts/<account>/
 
 The legacy `gws-oauth` storage name is deliberately retained; renaming the plugin must not silently move or lose existing accounts. Account selection chooses that directory, not an exported token. Global native accounts, raw-token environment variables and global Application Default Credentials are not automatically adopted. Native `gws auth` remains usable by the operator; the agent-facing `gws_api` blocks the auth namespace.
 
-The optional private `gws-remote-auth` companion adds chat-based `gws_login` and approval-gated local `gws_logout`. It is not needed for public operation and is not bundled here. Never paste client JSON or refresh tokens into chat.
+The optional private `gws-remote-auth` companion adds chat-based `gws_login` and approval-gated local `gws_logout`. It uses the same profile-bound account backend and `gws_bin` setting as the terminal commands. It is not needed for public operation and is not bundled here. Never paste client JSON or refresh tokens into chat.
 
 ## Tools
 

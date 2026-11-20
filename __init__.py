@@ -4,6 +4,9 @@ from pathlib import Path
 
 from .router import _ACCOUNT, account_health, bounded_gws, execute_gws, list_accounts
 
+# One instance per Hermes namespaced package; absent until registration succeeds.
+native_accounts = None
+
 
 class _PluginClient:
     """Bound native gws transport for the three watch tools."""
@@ -39,7 +42,9 @@ class _PluginClient:
 
 
 def register(ctx):
-    from hermes_constants import get_hermes_home
+    global native_accounts
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    from .account_backend import AccountBackend
     from . import watch as W
     from . import watch_calendar, watch_drive, watch_gmail, watch_routes, watch_tools
     from .session_origin import current_origin
@@ -123,7 +128,7 @@ def register(ctx):
             if not account or args.get("check_health"):
                 raise ValueError("Lifecycle check requires one account and no health request")
             account = account.lower()
-            # Companion holds lifecycle_guard across this read and its mutation.
+            # The account backend holds lifecycle_guard across this read and its mutation.
             # Do not take that lock again or hold SQLite across native processes.
             with runtime.store.read() as conn:
                 used = conn.execute(
@@ -141,9 +146,6 @@ def register(ctx):
             payload["health"] = {name: account_health(root(), name,
                 gws_bin=ctx.get_config("gws_bin", default="gws")) for name in names}
         return payload
-
-    from .account_cli import register_cli
-    register_cli(ctx, root, accounts)
 
     def api(args, **kwargs):
         return execute_gws(root(), args.get("account"), args.get("args"),
@@ -166,7 +168,7 @@ def register(ctx):
                     "check_health": {"type": "boolean", "default": False},
                     "check_lifecycle": {"type": "boolean", "default": False}}, "required": []}})
     ctx.register_tool(name="gws_api", toolset="google_workspace", handler=safe(api),
-        schema={"name": "gws_api", "description": "Advanced native Workspace API for one explicit account. Prefer curated tools and gws_schema. Native auth lifecycle/export is blocked; provision accounts with operator-side gws auth. Mutations, sends/shares and local file input/output require Hermes approval. Pass CLI tokens, not shell text. Large successful output returns output_file/output_bytes; process locally and remove after use. Failures are sanitized.",
+        schema={"name": "gws_api", "description": "Advanced native Workspace API for one explicit account. Prefer curated tools and gws_schema. Native auth lifecycle/export is blocked; provision accounts with operator-side hermes gws login. Mutations, sends/shares and local file input/output require Hermes approval. Pass CLI tokens, not shell text. Large successful output returns output_file/output_bytes; process locally and remove after use. Failures are sanitized.",
                 "parameters": {"type": "object", "additionalProperties": False, "properties": {
                     "account": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}}}, "required": ["account", "args"]}})
@@ -182,3 +184,30 @@ def register(ctx):
                           handler=watch_handler(service), schema=module.tool_schema())
 
     ctx.register_hook("pre_gateway_dispatch", watch_tools.bridge_callback(runtime.store, ctx, runtime.routes, profile=profile))
+
+    def lifecycle_check(args):
+        # Companion completion threads have no routed ContextVars. This instance
+        # is already bound to this home; bind only that home for the local read.
+        token = set_hermes_home_override(home)
+        try:
+            return accounts(args)
+        finally:
+            reset_hermes_home_override(token)
+
+    def native_binary():
+        token = set_hermes_home_override(home)
+        try:
+            return ctx.get_config("gws_bin", default="gws")
+        finally:
+            reset_hermes_home_override(token)
+
+    from .account_cli import register_cli
+    backend = AccountBackend(home / "gws-oauth", native_binary, lifecycle_check)
+
+    def cli_backend():
+        root()  # Never borrow a different profile's loaded CLI descriptor.
+        return backend
+
+    register_cli(ctx, cli_backend)
+    ctx.on_unload(backend.close)
+    native_accounts = backend
