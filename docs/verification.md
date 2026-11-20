@@ -1,27 +1,38 @@
 # Installed verification
 
-Runtime tested: `5e7ffc29774b5d1ee664e3a8e4603cd5081cf124` (0.9.0), native gws 0.22.5, Linux. The installed check below predates the shared native account backend.
+## v0.9.0 release verification
 
-## Real Google PUSH → Hermes → Discord
+Runtime tested: `67d7d3bcab717ace38c30025aeef80b95dbb40f3`, native gws 0.22.5, Linux. The release preparation changes documentation only; no runtime or test code changes follow this live-tested revision.
 
-An explicitly authorized operator harness exercised the installed plugin with an existing Google account, a supervised worker, public HTTPS callback forwarding and preprovisioned native Hermes webhook routes:
+### Authentication and account isolation
+
+- Fresh browser consent completed for one account through `hermes gws login EMAIL --full`, including a manually relayed native loopback callback and successful CLI exit.
+- A second account completed fresh consent through the optional private `gws-remote-auth` companion.
+- Both account slots were healthy simultaneously. Explicit-account Gmail identity reads passed; the personal account also passed Drive and Calendar reads.
+- The private companion is not a dependency of public CLI login or Workspace operations. Its tests are separate from the public release.
+
+### Real Google PUSH → Hermes
+
+An authorized integration test used disposable Gmail, Drive and Calendar objects with a supervised worker, public HTTPS ingress and operator-provisioned Hermes routes:
 
 - Gmail: sent a uniquely tagged message to the same account.
 - Drive: renamed a disposable file and read the change back.
 - Calendar: changed a disposable event and read the change back.
-- Each service received authenticated/validated callback hints and reconciled through native gws.
-- All three watch outboxes were admitted on their first attempt; all three native admissions completed.
-- All three native delivery obligations reached `delivered`, with no delivery error. Retained destinations were checked against the intended Discord thread; HTTP acceptance alone was not counted as delivery.
-- All watches were stopped and reached cleanup state `done`. The test message and file were trashed, and the event was deleted; cleanup was read back.
+- Each service was watched in both `same_session` and `new_session` modes. All six matched and produced model acknowledgments.
+- All six host delivery obligations reached `delivered` with no recorded error. Three same-session acknowledgments were observed in the originating Discord thread; three new-session acknowledgments completed through the configured native webhook delivery route. Plugin admission alone was not counted as execution.
+- Same-session notifications queued behind an active turn; delayed acknowledgment was not treated as a lost event.
+- All six watches were explicitly stopped, reached cleanup state `done`, and retained no delivery route bindings. Shared operator infrastructure was preserved.
+- After renewed user approval following an approval timeout, the test message and file were trashed and the calendar event deleted. Exact-object readback confirmed `TRASH`, `trashed: true`, and `status: cancelled`. Account credentials were preserved.
 
-The worker remains supervised; installation itself does not provision this infrastructure. See [watch setup](watch-setup.md).
+### Automated checks
 
-## Automated checks
+- Public installed suite: **229 tests passed, zero skipped**.
+- Private companion suite: **72 tests passed, zero skipped**, plus the cross-plugin lifecycle check.
+- [Public CI at the live-tested runtime](https://github.com/anpicasso/hermes-google-workspace/actions/runs/44677238577) passed against the workflow's pinned Hermes host and native gws.
+- Native dry-run tests may fetch public discovery schemas. A fresh credential-free HOME in a network-disabled sandbox can fail discovery without indicating an API mutation or argv regression; the passing isolated run permitted discovery access while keeping the host filesystem read-only.
 
-The historical installed runtime passed its own suites and CI. The public suite exercises local CLI dispatch, isolated native subprocesses, writer exclusion, and routing refusal after a wrong identity. The matching private suite loads both plugins through the Hermes loader and exercises an off-PATH binary, callback/session binding, cancellation, watch refusal and logout. Successful token exchange and identity lookup are simulated. An installed gws 0.22.5 is tested with synthetic inputs for the missing-gcloud setup error, consent URL generation followed by cancellation, and local logout. No Google account or external messaging platform is contacted in these tests. See [compatibility](compatibility.md) for the reproducible host baseline.
+## Limits of this evidence
 
-## What this does not prove
+The live test covers Linux, two account login paths, selected authenticated reads, actual Google changes, both notification modes, approval handling and cleanup. It does not prove Windows support, long-duration lease renewal, expired-token recovery, or exactly-once delivery. The documented concurrent session-reset race and trusted-operator profile boundary remain. Validate/Doctor success and functional tests do not grant catalog admission or waive the internal-host API disclosure.
 
-This was an operator-driven installed-code test, **not** a real user `/gws-bind` command or same-session gateway-delivery test. It did not exercise fresh browser consent, expired-account reauthorization, two simultaneously valid Google identities, Windows locking, or long-duration lease renewal. Do not infer those results from the successful three-service push test.
-
-The documented same-session reset race and trusted-conversation boundary still apply; see [compatibility](compatibility.md). Existing-account API success does not imply that every stored account has valid consent.
+See [compatibility](compatibility.md), [watch setup](watch-setup.md), and [catalog policy](catalog-policy.md). The worker and cloud routes remain operator-provisioned; installation does not start them.

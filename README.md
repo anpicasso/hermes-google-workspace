@@ -8,10 +8,10 @@ Multi-account Google Workspace access through the [native `gws` CLI](https://git
 
 Requirements: Hermes with the plugin APIs and bound-context compatibility adapter described in [compatibility](docs/compatibility.md), native `gws` (tested baseline 0.22.5), and the Python dependencies declared in `plugin.yaml` (PyYAML, aiohttp and google-auth with requests). Watches require POSIX locking and a separately supervised worker. No binary, cloud provisioning or worker auto-start is included.
 
-For this development branch, install the exact tested commit rather than assuming a release exists:
+Install the v0.9.0 release:
 
 ```bash
-hermes plugins install anpicasso/hermes-google-workspace --ref <full-tested-commit> --enable
+hermes plugins install anpicasso/hermes-google-workspace --ref v0.9.0 --enable
 hermes config set plugins.entries.google-workspace.settings.gws_bin /absolute/path/to/gws
 ```
 
@@ -39,7 +39,9 @@ $HERMES_HOME/gws-oauth/accounts/<account>/
 
 The legacy `gws-oauth` storage name is deliberately retained; renaming the plugin must not silently move or lose existing accounts. Account selection chooses that directory, not an exported token. Global native accounts, raw-token environment variables and global Application Default Credentials are not automatically adopted. Native `gws auth` remains usable by the operator; the agent-facing `gws_api` blocks the auth namespace.
 
-The optional private `gws-remote-auth` companion adds chat-based `gws_login` and approval-gated local `gws_logout`. It uses the same profile-bound account backend and `gws_bin` setting as the terminal commands. It is not needed for public operation and is not bundled here. Never paste client JSON or refresh tokens into chat.
+### Optional remote login
+
+The separately installed private [hermes-gws-remote-auth](https://github.com/anpicasso/hermes-gws-remote-auth) companion (`gws-remote-auth`) adds chat-based `gws_login` and approval-gated local `gws_logout`. It shares this plugin's profile-bound account backend and `gws_bin` setting. Repository access is restricted; it is not bundled, listed in the catalog, or required for public operation. Without it, use the terminal commands above. Never paste client JSON or refresh tokens into chat.
 
 ## Tools
 
