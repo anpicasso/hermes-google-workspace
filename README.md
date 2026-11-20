@@ -2,7 +2,7 @@
 
 Multi-account Google Workspace access through the [native `gws` CLI](https://github.com/googleworkspace/cli): curated Gmail, Drive and Calendar tools, guarded advanced commands, and targeted change notifications.
 
-**Native `gws` owns Google credentials, decryption and refresh.** This public plugin does not implement OAuth login, export tokens, or require the optional private remote-login companion. One Hermes profile belongs to one trusted operator; all authorized sessions in that profile can use its connected accounts.
+**Native `gws` owns Google credentials, decryption and refresh.** This public plugin does not implement OAuth login, export tokens, or require the optional remote-login companion. One Hermes profile belongs to one trusted operator; all authorized sessions in that profile can use its connected accounts.
 
 ## Install and configure
 
@@ -41,7 +41,7 @@ The legacy `gws-oauth` storage name is deliberately retained; renaming the plugi
 
 ### Optional remote login
 
-The separately installed private [hermes-gws-remote-auth](https://github.com/anpicasso/hermes-gws-remote-auth) companion (`gws-remote-auth`) adds chat-based `gws_login` and approval-gated local `gws_logout`. It shares this plugin's profile-bound account backend and `gws_bin` setting. Repository access is restricted; it is not bundled, listed in the catalog, or required for public operation. Without it, use the terminal commands above. Never paste client JSON or refresh tokens into chat.
+The optional [hermes-gws-remote-auth](https://github.com/anpicasso/hermes-gws-remote-auth) companion is publicly available but **is not being submitted to the Hermes catalog**. It adds chat-based `gws_login` and approval-gated local `gws_logout`, sharing this plugin's native account backend. It is separate because remote consent and cross-device callback handling introduce chat-history exposure and gateway-specific bindings that are unnecessary for Workspace tools and watches. Keeping it outside this catalog submission makes that convenience an explicit opt-in, not a dependency or a claim of catalog compliance. Without it, use the terminal commands above. Never paste client JSON or refresh tokens into chat.
 
 ## Tools
 
@@ -84,7 +84,7 @@ The operator provisions delivery routes and public HTTPS ingress; one separately
 
 ## Migration, security and removal
 
-Disable the old `gws-oauth` plugin before enabling this one; duplicate tool names must not coexist. Preserve account directories and stop/review existing watches before switching route configuration. Move operator settings to `plugins.entries.google-workspace.settings`; do not copy credentials into the installed plugin directory. The private companion is installed separately if wanted.
+Disable the old `gws-oauth` plugin before enabling this one; duplicate tool names must not coexist. Preserve account directories and stop/review existing watches before switching route configuration. Move operator settings to `plugins.entries.google-workspace.settings`; do not copy credentials into the installed plugin directory. The optional companion is installed separately if wanted.
 
 Before removal, stop watches, allow remote cleanup, then stop the worker. Operator-provisioned Pub/Sub and Hermes routes are never deleted by this plugin. Removing the plugin does not remove credentials, watch state, or response files.
 

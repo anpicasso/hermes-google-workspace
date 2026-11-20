@@ -1,6 +1,6 @@
 # Targeted Workspace watches: operator setup
 
-The public `google-workspace` v0.9.0 plugin uses explicitly provisioned native accounts. [Native `gws` owns authentication](login.md); the private `hermes-gws-remote-auth` companion is optional. No Python OAuth export/refresh or Pub/Sub pull is used.
+The public `google-workspace` v0.9.0 plugin uses explicitly provisioned native accounts. [Native `gws` owns authentication](login.md); the optional `hermes-gws-remote-auth` companion is optional. No Python OAuth export/refresh or Pub/Sub pull is used.
 
 ## Provision Google ingress
 

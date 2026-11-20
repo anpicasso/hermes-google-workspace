@@ -24,7 +24,7 @@ The public adapter selects that store using `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`; g
 
 `hermes gws setup EMAIL` runs the native wizard, which can sign into gcloud, create/select a project, enable APIs, and prompt for the Desktop client ID and secret from Cloud Console. Enter those only in the local native terminal. The wizard may also offer login; its result is checked before routing. With an existing native client in this slot, skip the wizard and run `hermes gws login EMAIL`.
 
-The optional private `gws-remote-auth` companion supplies conversational login/logout and cross-device callbacks **after** the same native setup. It has no profile/global client fallback. The public plugin works without it. Never paste client JSON, exported credentials or tokens into chat.
+The optional `gws-remote-auth` companion supplies conversational login/logout and cross-device callbacks **after** the same native setup. It has no profile/global client fallback. The public plugin works without it. Never paste client JSON, exported credentials or tokens into chat.
 
 ## Verify and troubleshoot
 

@@ -7,9 +7,9 @@ Runtime tested: `67d7d3bcab717ace38c30025aeef80b95dbb40f3`, native gws 0.22.5, L
 ### Authentication and account isolation
 
 - Fresh browser consent completed for one account through `hermes gws login EMAIL --full`, including a manually relayed native loopback callback and successful CLI exit.
-- A second account completed fresh consent through the optional private `gws-remote-auth` companion.
+- A second account completed fresh consent through the optional `gws-remote-auth` companion.
 - Both account slots were healthy simultaneously. Explicit-account Gmail identity reads passed; the personal account also passed Drive and Calendar reads.
-- The private companion is not a dependency of public CLI login or Workspace operations. Its tests are separate from the public release.
+- The optional companion is not a dependency of public CLI login or Workspace operations. Its tests are separate from the public release.
 
 ### Real Google PUSH → Hermes
 
@@ -27,7 +27,7 @@ An authorized integration test used disposable Gmail, Drive and Calendar objects
 ### Automated checks
 
 - Public installed suite: **229 tests passed, zero skipped**.
-- Private companion suite: **72 tests passed, zero skipped**, plus the cross-plugin lifecycle check.
+- Remote-auth companion suite: **72 tests passed, zero skipped**, plus the cross-plugin lifecycle check.
 - [Public CI at the live-tested runtime](https://github.com/anpicasso/hermes-google-workspace/actions/runs/44677238577) passed against the workflow's pinned Hermes host and native gws.
 - Native dry-run tests may fetch public discovery schemas. A fresh credential-free HOME in a network-disabled sandbox can fail discovery without indicating an API mutation or argv regression; the passing isolated run permitted discovery access while keeping the host filesystem read-only.
 

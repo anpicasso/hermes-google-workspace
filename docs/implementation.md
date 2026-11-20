@@ -2,7 +2,7 @@
 
 ## Public adapter boundary
 
-`google-workspace` v0.9.0 is a native credential-owned adapter. `__init__.py` registers curated tools, `gws_api`, `gws_accounts`, three watch tools and public approval/dispatch hooks. It does not register login/logout tools or run a login manager. The private `hermes-gws-remote-auth` companion is optional and separately installed; its login implementation is not the public execution path.
+`google-workspace` v0.9.0 is a native credential-owned adapter. `__init__.py` registers curated tools, `gws_api`, `gws_accounts`, three watch tools and public approval/dispatch hooks. It does not register login/logout tools or run a login manager. The optional `hermes-gws-remote-auth` companion is optional and separately installed; its login implementation is not the public execution path.
 
 `router.py` selects `$HERMES_HOME/gws-oauth/accounts/<account>/` through `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`, sets the file keyring backend and invokes `[gws_bin, *args]` without a shell. Account paths/files reject unsafe links. A filtered subprocess environment, isolated native HOME and empty dotenv sentinel prevent accidental adoption of inherited tokens, global ADC or ancestor dotenv credentials. Python inspects account-file metadata; native `gws` owns credential contents, decryption and refresh.
 

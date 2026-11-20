@@ -20,7 +20,7 @@ Use `hermes gws setup EMAIL` for the native interactive wizard, then `hermes gws
 
 Stop watches and finish cleanup before changing auth. Native changes happen in place: there is no rollback. Failed, interrupted and wrong-identity attempts block routing until verified login. If an old token cache or plaintext fallback exists, explicitly log out before replacement. Logout is local, not Google consent revocation. Use `hermes --profile NAME gws ...` for another profile. By default the binary is on PATH; the shared override is `plugins.entries.google-workspace.settings.gws_bin`.
 
-These are terminal commands. The optional private `gws_login`/`gws_logout` handle remote browser consent after client setup. The public plugin never intercepts callbacks or exports tokens. See `docs/login.md`.
+These are terminal commands. The optional companion tools `gws_login`/`gws_logout` handle remote browser consent after client setup. The public plugin never intercepts callbacks or exports tokens. See `docs/login.md`.
 
 ## Agent-driven watches
 

@@ -20,7 +20,7 @@ Already have a working native client in the selected slot? Skip setup. Alternati
 - **accounts** lists routable stored slots without a network call. A slot name alone is not an identity or validity check. **status** reports sanitized native health/scopes or that the slot is blocked. It exits nonzero unless validity is confirmed.
 - **logout** asks native `gws auth logout` to clear only this account's local credentials and caches and checks the result. The directory, encryption key and client configuration may remain. If a credential file still exists, including an interrupted native `credentials.tmp` that gws 0.22.5 logout does not remove, it returns `logout_unconfirmed` and leaves the slot blocked. This does **not** revoke Google consent or delete Google data.
 
-The executable defaults to `gws` on PATH. To override it set `plugins.entries.google-workspace.settings.gws_bin` to an executable path, not a command line. A missing override does not fall back. The same setting applies to the private companion; it has no binary setting of its own.
+The executable defaults to `gws` on PATH. To override it set `plugins.entries.google-workspace.settings.gws_bin` to an executable path, not a command line. A missing override does not fall back. The same setting applies to the optional companion; it has no binary setting of its own.
 
 ## Concurrent use and recovery
 
@@ -30,4 +30,4 @@ Stop active/matched watches and finish remote cleanup before setup, login or log
 
 Each native command receives a disposable HOME, file keyring, explicit config directory and controlled working directory; inherited raw tokens, client secrets, ADC and ancestor dotenv credentials are not used. This is cooperative isolation for a trusted single-operator profile, not a sandbox against other processes under the same UID.
 
-On a remote host the browser's localhost may not reach native gws. Use a supported loopback/tunnel workflow or the optional private `gws-remote-auth` companion for **login after client setup**. The public plugin has no callback interceptor or agent login tool; `gws_api` blocks native auth/export.
+On a remote host the browser's localhost may not reach native gws. Use a supported loopback/tunnel workflow or the optional `gws-remote-auth` companion for **login after client setup**. The public plugin has no callback interceptor or agent login tool; `gws_api` blocks native auth/export.

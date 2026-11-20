@@ -1,6 +1,6 @@
 # Workspace tools and approvals
 
-The public `google-workspace` v0.9.0 adapter leaves credentials and refresh to native `gws`. Start with [OAuth setup](oauth-setup.md) and [operator provisioning](login.md); see the [catalog disclosure](catalog-policy.md). The separate private `hermes-gws-remote-auth` companion is optional, not a public runtime dependency.
+The public `google-workspace` v0.9.0 adapter leaves credentials and refresh to native `gws`. Start with [OAuth setup](oauth-setup.md) and [operator provisioning](login.md); see the [catalog disclosure](catalog-policy.md). The separate `hermes-gws-remote-auth` companion is optional, not a public runtime dependency.
 
 One profile is one trusted operator. Every connected Google account belongs to that operator; every session authorized to use this profile can use those accounts. Choose an explicit `account` on every Workspace call. Use separate profiles and access controls for different operators.
 
@@ -45,7 +45,7 @@ The same `pre_tool_call` hook classifies generic and curated calls before execut
 
 - Known reads and schema/help discovery run without this additional gate.
 - Mutations (including drafts), deletes, sends, sharing, uploads and local output files request **native Hermes approval**. Unknown methods/options/helpers and most request bodies also request approval. Calendar free/busy is a known read-only POST exception.
-- The native `auth` namespace is blocked through the agent-facing executor. Use the [profile-scoped `hermes gws` terminal commands](login.md) for setup, login and logout, or `gws_accounts(check_health=true)` for sanitized status. Public tools do not include `gws_login` or `gws_logout`; those belong to the optional private companion.
+- The native `auth` namespace is blocked through the agent-facing executor. Use the [profile-scoped `hermes gws` terminal commands](login.md) for setup, login and logout, or `gws_accounts(check_health=true)` for sanitized status. Public tools do not include `gws_login` or `gws_logout`; those belong to the optional companion.
 - Model arguments such as `approved=true` cannot grant approval. Host approval mode, existing operator grants and frontend approval support determine the result; this is not an independent per-call confirmation system or an OS sandbox.
 
 Curated approval previews always show recipients, attendees, share targets and paths in full; only body/description/message text is shortened. Generic `gws_api` previews are bounded and marked when truncated; inspect the full intended operation before approving a long generic request. A successful remote mutation followed by a local output/transport failure is not safe to blindly retry: read back the remote object first.
